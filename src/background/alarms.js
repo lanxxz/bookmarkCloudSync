@@ -9,7 +9,7 @@
  */
 import { logger } from '../lib/log.js';
 import { getSettings } from '../lib/auth.js';
-import { getIdbState, setMeta } from '../lib/idb.js';
+import { getIdbState, getMeta, setMeta } from '../lib/idb.js';
 import { backendFor, peekTokenFor, resolveBackend } from '../lib/storage/index.js';
 
 export const ALARM_SYNC = 'bcs-sync';

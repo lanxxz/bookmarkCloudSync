@@ -17,6 +17,13 @@ import { requireToken, peekToken } from '../auth.js';
 export { StorageError, isConflict, isAuthError } from './base.js';
 export const BACKENDS = Object.freeze({ DRIVE: 'drive', GITHUB: 'github' });
 
+/*
+ * 这里曾经有一句 export { StorageError as Error }。
+ * 它把全局 Error 遮蔽成 StorageError：任何走它的 throw new Error(...) 都会变成
+ * StorageError（凭空多出 code 字段），静态检查也会把全项目的 Error 当成
+ * "从 storage/index.js 导入"的符号 —— 纯负资产，已删除。
+ */
+
 /**
  * 后端必须实现的全部方法。
  *
@@ -136,4 +143,4 @@ export async function requireReady(settings) {
   return name;
 }
 
-export { StorageError as Error };
+

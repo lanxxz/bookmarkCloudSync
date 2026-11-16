@@ -1,12 +1,12 @@
 {
   "name": "bookmark-cloud-sync",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "private": true,
   "description": "双向书签同步扩展（Chrome / ego(lite)），支持 GitHub 私有仓库与 Google Drive 两种云端",
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "check": "node tools/validate.mjs && node tools/mv3-check.mjs && node tools/linkcheck.mjs && node tools/unused.mjs",
+    "check": "node tools/validate.mjs && node tools/mv3-check.mjs && node tools/check-undefined.mjs && node tools/linkcheck.mjs && node tools/unused.mjs",
     "pack": "node tools/package.mjs",
     "verify": "node tools/verify-doc.mjs bookmarks.json --prev auto",
     "icons": "node tools/make-icons.mjs",

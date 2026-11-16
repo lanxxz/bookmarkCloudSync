@@ -25,6 +25,7 @@ import {
   indexToNodes,
   createDoc,
   serializeDoc,
+  docFromJson,
   docStats,
   normalizeIndices,
   planLocalApply,
@@ -602,7 +603,7 @@ export async function applyPendingSync({ token } = {}) {
   const state = await loadState();
   if (!state || !state.pending) return { ok: false, error: '没有等待确认的操作' };
   const s = await getSettings();
-  const auth = token || (await requireToken());
+  const auth = token || (await resolveToken(s));
   const pending = state.pending;
   const local = await scanLocal({ mapping: state.mapping, deviceId: state.deviceId });
   const localIndex = normalizeIndices(local.nodes);
