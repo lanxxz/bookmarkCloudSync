@@ -133,3 +133,152 @@ test('looksLikeNode 只认有 id 与 type 的对象', () => {
 test('validateDoc 对数组直接拒绝（不会被 repair 掩盖）', () => {
   assert.match(validateDoc([{ id: 'a', type: 'bookmark' }]).join(), /是数组/);
 });
+
+/* ---------------- schemaVersion 异常 ---------------- */
+
+test('缺少 schemaVersion 但节点正常 -> 自动补齐（missing-schema）', () => {
+  const broken = { revision: 3, writer: 'dev-a', nodes: GOOD.nodes };
+  const r = docFromJson(JSON.stringify(broken));
+  assert.equal(r.ok, true);
+  assert.equal(r.repaired, 'missing-schema');
+  assert.equal(r.doc.schemaVersion, 2);
+  assert.equal(r.doc.nodes.size, 2);
+});
+
+test('缺少 schemaVersion 且 nodes 为空 -> 也补（空库是合法的）', () => {
+  const r = docFromJson(JSON.stringify({ revision: 1, nodes: [] }));
+  assert.equal(r.ok, true);
+  assert.equal(r.repaired, 'missing-schema');
+});
+
+test('缺少 schemaVersion 且 nodes 不像节点 -> 不瞎猜，报错并说清缺什么', () => {
+  const r = docFromJson(JSON.stringify({ revision: 1, nodes: [{ hello: 'world' }] }));
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'invalid-doc');
+  assert.match(r.errors.join(), /缺少 schemaVersion/);
+  assert.match(r.errors.join(), /不像书签节点/);
+});
+
+test('schemaVersion 是字符串时明确指出类型问题，而不是说"缺少"', () => {
+  const r = docFromJson(JSON.stringify({ ...GOOD, schemaVersion: '2' }));
+  assert.equal(r.ok, true, '字符串版本号应被补齐');
+  assert.equal(r.repaired, 'missing-schema');
+});
+
+test('schemaVersion 是 null / 对象时给出可读原因', () => {
+  const r = docFromJson(JSON.stringify({ ...GOOD, schemaVersion: null, nodes: [{ hello: 1 }] }));
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(), /缺少 schemaVersion/);
+
+  const r2 = docFromJson(JSON.stringify({ ...GOOD, schemaVersion: {}, nodes: [{ hello: 1 }] }));
+  assert.equal(r2.ok, false);
+  assert.match(r2.errors.join(), /schemaVersion 不是数字/);
+});
+
+test('invalid-doc 会带上实际结构，便于对症处理', () => {
+  const r = docFromJson(JSON.stringify({ revision: 1, nodes: 'oops' }));
+  assert.equal(r.ok, false);
+  assert.match(r.shape, /object\{revision:number,nodes:string\}/);
+});
+
+/* ---------------- 文件被写成 GitHub API 响应 ---------------- */
+
+function b64(s) {
+  return Buffer.from(s, 'utf8').toString('base64');
+}
+
+function apiResponse(doc, extra = {}) {
+  return {
+    name: 'bookmarks.json',
+    path: 'bookmarks.json',
+    sha: 'deadbeef',
+    size: 1234,
+    url: 'https://api.github.com/repos/o/r/contents/bookmarks.json',
+    html_url: 'https://github.com/o/r/blob/main/bookmarks.json',
+    content: b64(JSON.stringify(doc)),
+    encoding: 'base64',
+    ...extra
+  };
+}
+
+test('GitHub API 响应对象能被认出并解开（数据可救回）', () => {
+  const r = docFromJson(JSON.stringify(apiResponse(GOOD)));
+  assert.equal(r.ok, true);
+  assert.equal(r.repaired, 'github-api-response');
+  assert.equal(r.doc.nodes.size, 2);
+});
+
+test('GitHub API 响应里包着"缺 schemaVersion"的文档也能一路救回', () => {
+  const { schemaVersion, ...noVer } = GOOD;
+  const r = docFromJson(JSON.stringify(apiResponse(noVer)));
+  assert.equal(r.ok, true);
+  assert.equal(r.repaired, 'github-api-response');
+  assert.equal(r.doc.schemaVersion, 2);
+});
+
+test('GitHub API 响应但缺 content -> 明确说明，而不是"缺少 schemaVersion"', () => {
+  const resp = apiResponse(GOOD);
+  delete resp.content;
+  const r = docFromJson(JSON.stringify(resp));
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(), /GitHub Contents API/);
+  assert.match(r.errors.join(), /缺少 content/);
+});
+
+test('GitHub API 响应的 content 不是 JSON -> 明确报 content 解不出', () => {
+  const resp = apiResponse(GOOD, { content: b64('这不是 JSON') });
+  const r = docFromJson(JSON.stringify(resp));
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(), /解不出合法 JSON/);
+  assert.match(r.errors.join(), /没有可恢复的书签数据/);
+});
+
+test('普通文档不会被误判成 GitHub API 响应', () => {
+  assert.equal(docFromJson(JSON.stringify(GOOD)).repaired, undefined);
+});
+
+test('describeShape 能看到 content 字段的存在', () => {
+  const shape = describeShape(apiResponse(GOOD));
+  assert.match(shape, /content:string/);
+  assert.match(shape, /encoding:string/);
+});
+
+import { StorageError } from '../src/lib/storage/base.js';
+import { isConflict } from '../src/lib/storage/base.js';
+
+test('sha 缺失（422）不能被当成并发冲突', async () => {
+  const { StorageError: SE } = await import('../src/lib/storage/base.js');
+  const err = new SE('写入时没有提供 sha', { status: 422, code: 'SHA_MISSING' });
+  assert.equal(isConflict(err), false, 'SHA_MISSING 不应进入重试分支');
+});
+
+test('content 为空串时说明是 >1MB 未内联，而不是含糊的"缺少 schemaVersion"', () => {
+  const resp = apiResponse(GOOD, { content: '', encoding: 'none' });
+  const r = docFromJson(JSON.stringify(resp));
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(), /content 是空字符串/);
+  assert.match(r.errors.join(), /没有可恢复的书签数据/);
+});
+
+test('content 被截断时说明长度与截断可能', () => {
+  const resp = apiResponse(GOOD, { content: 'eyJub2RlcyI6W' });
+  const r = docFromJson(JSON.stringify(resp));
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(), /长度 1[0-9] 字节/);
+  assert.match(r.errors.join(), /可能被截断/);
+});
+
+test('content 是明文 JSON（非 base64）也能解出', () => {
+  const resp = apiResponse(GOOD, { content: JSON.stringify(GOOD) });
+  const r = docFromJson(JSON.stringify(resp));
+  assert.equal(r.ok, true);
+  assert.equal(r.repaired, 'github-api-response');
+});
+
+test('content 是二次 base64 也能解出', () => {
+  const inner = b64(JSON.stringify(GOOD));
+  const resp = apiResponse(GOOD, { content: b64(inner) });
+  const r = docFromJson(JSON.stringify(resp));
+  assert.equal(r.ok, true);
+  assert.equal(r.repaired, 'github-api-response');
+});

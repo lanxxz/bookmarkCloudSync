@@ -11,7 +11,7 @@
  * 也能从快照里看出当时哪些节点被删了（deleted=true + deletedAt）。
  */
 import { logger } from './log.js';
-import { indexToNodes, nodesToIndex, docStats, SCHEMA_VERSION } from './protocol.js';
+import { indexToNodes, nodesToIndex, docStats, SCHEMA_VERSION, docFromJson, describeShape } from './protocol.js';
 import { putSnapshot, listSnapshots, pruneLocalSnapshots, getSnapshot, deleteSnapshot } from './idb.js';
 import { getSettings } from './auth.js';
 import { formatTime } from './util.js';
@@ -194,24 +194,41 @@ export async function loadSnapshotNodes({ id, source, token, settings } = {}) {
     };
   }
 
+  /** 恢复也要能容错：历史文件同样可能是坏的，JSON.parse 直崩会让恢复彻底没救 */
+  const readNodes = (res, what) => {
+    const parsed = docFromJson(res.text);
+    if (parsed.ok) {
+      return { nodes: parsed.doc.nodes, doc: parsed.doc, repaired: parsed.repaired || '' };
+    }
+    /* 快照文件不是同步文档（没有 schemaVersion），退回宽松解析 */
+    let data = null;
+    try {
+      data = JSON.parse(res.text);
+    } catch {
+      throw new Error(what + ' 无法解析：' + ((parsed.errors || []).join('；') || parsed.error));
+    }
+    if (!data || !Array.isArray(data.nodes)) {
+      throw new Error(what + ' 缺少 nodes 数组（结构：' + describeShape(data) + '）');
+    }
+    return { nodes: nodesToIndex(data.nodes), doc: data, repaired: '' };
+  };
+
   // GitHub 的 commit 历史走 readAtVersion({ commit })
   if (String(source).startsWith('github-commit') || String(id).startsWith('commit:')) {
     const commit = String(id).startsWith('commit:') ? String(id).slice(7) : String(id);
     const res = await backend.readAtVersion(cfg, { commit, token });
-    const doc = JSON.parse(res.text);
-    if (!Array.isArray(doc.nodes)) throw new Error('该版本缺少 nodes');
+    const got = readNodes(res, '该 commit');
     return {
-      nodes: nodesToIndex(doc.nodes),
-      meta: { ts: doc.updatedAt, kind: 'commit', deviceId: doc.writer, count: doc.nodes.length }
+      nodes: got.nodes,
+      meta: { ts: got.doc.updatedAt, kind: 'commit', deviceId: got.doc.writer, count: got.nodes.size, repaired: got.repaired }
     };
   }
 
   const res = await backend.readAtVersion(cfg, { id, token });
-  const data = JSON.parse(res.text);
-  if (!Array.isArray(data.nodes)) throw new Error('快照文件缺少 nodes');
+  const got = readNodes(res, '该快照');
   return {
-    nodes: nodesToIndex(data.nodes),
-    meta: { ts: data.ts, kind: data.snapshotKind, deviceId: data.deviceId, count: data.count }
+    nodes: got.nodes,
+    meta: { ts: got.doc.ts, kind: got.doc.snapshotKind, deviceId: got.doc.deviceId, count: got.nodes.size, repaired: got.repaired }
   };
 }
 

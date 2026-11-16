@@ -87,7 +87,18 @@ function mapError(res, text, what) {
     return new StorageError('仓库或路径不存在：' + message, { status: 404, code: 'NOT_FOUND' });
   }
   if (res.status === 409 || res.status === 422) {
-    if (/sha/i.test(message) || res.status === 409) {
+    /* 只有明确的 sha 不匹配才是并发冲突。
+     * "sha wasn't supplied" / "Invalid request... sha" 是调用方没带 sha，属于代码错误，
+     * 误判成 CONFLICT 会让上层反复重读重试，永远修不好。 */
+    const shaMissing = /sha\b.*(supplied|required|missing)|(supplied|required|missing).*\bsha\b/i.test(message);
+    if (shaMissing) {
+      return new StorageError(what + ' 失败：写入时没有提供 sha（更新已存在文件必须带上 blob sha）：' + message, {
+        status: res.status,
+        code: 'SHA_MISSING'
+      });
+    }
+    const shaMismatch = /sha.*(does not match|mismatch|is at|but expected)/i.test(message);
+    if (res.status === 409 || shaMismatch) {
       return new StorageError('云端已被其它设备更新（sha 不匹配）', { status: res.status, code: 'CONFLICT' });
     }
     return new StorageError(what + ' 失败：' + message, { status: res.status, code: 'UNPROCESSABLE' });
@@ -176,7 +187,11 @@ export async function readFile(cfg, path, { token, ref } = {}) {
 
   // ≤1MB 走内联 base64；更大的文件 GitHub 会返回 encoding: 'none'
   if (meta.encoding !== 'none' && meta.content) {
-    return { exists: true, text: fromBase64Utf8(meta.content), version: meta.sha, size };
+    const text = fromBase64Utf8(meta.content);
+    /* 自愈：文件里躺着的是一份 Contents API 响应对象时，真数据在它自己的
+     * content 字段里。这种情况通常是外部工具误写。能解出来就用解出来的。 */
+    const unwrapped = unwrapNestedApiResponse(text);
+    return { exists: true, text: unwrapped || text, version: meta.sha, size, unwrapped: !!unwrapped };
   }
 
   const { text } = await ghFetch(api + query, {
@@ -184,7 +199,8 @@ export async function readFile(cfg, path, { token, ref } = {}) {
     accept: 'application/vnd.github.raw',
     raw: true
   });
-  return { exists: true, text, version: meta.sha, size };
+  const unwrappedRaw = unwrapNestedApiResponse(text);
+  return { exists: true, text: unwrappedRaw || text, version: meta.sha, size, unwrapped: !!unwrappedRaw };
 }
 
 /** 只取元数据（sha / size），不下载正文 —— 给远端轮询用 */
@@ -437,4 +453,45 @@ export async function connectGithub({ token, owner, repo } = {}) {
   const record = { token: clean, login: account.login, owner, repo, addedAt: Date.now() };
   await writeGithubAuth(record);
   return { ...record, repoInfo: info };
+}
+
+/**
+ * 文件内容本身是一份 Contents API 响应对象时，把里面真正的正文取出来。
+ *
+ * 现场：bookmarks.json 里躺着 { name, path, sha, ..., content, encoding }，
+ * 真数据在 content（base64）里。外部工具误写过一次就会永久卡住同步，
+ * 这里做一次透明解包，让读取路径自己恢复。
+ *
+ * 解不出来就返回 null，调用方按原样处理（后续 docFromJson 会给出可读诊断）。
+ */
+export function unwrapNestedApiResponse(text) {
+  const raw = typeof text === 'string' ? text.trim() : '';
+  if (!raw || raw[0] !== '{') return null;
+  let outer;
+  try {
+    outer = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!outer || typeof outer !== 'object' || Array.isArray(outer)) return null;
+  if (Array.isArray(outer.nodes)) return null; // 本来就是文档
+  const looksApi = typeof outer.sha === 'string' && typeof outer.path === 'string';
+  if (!looksApi) return null;
+  if (typeof outer.content !== 'string' || !outer.content) return null;
+
+  let inner;
+  try {
+    inner = fromBase64Utf8(outer.content);
+  } catch {
+    return null;
+  }
+  if (!inner) return null;
+  const trimmed = inner.trim();
+  if (trimmed[0] !== '{' && trimmed[0] !== '[') return null;
+  try {
+    JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  return trimmed;
 }

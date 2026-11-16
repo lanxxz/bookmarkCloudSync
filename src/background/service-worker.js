@@ -262,6 +262,9 @@ async function handleMessage(msg) {
     case MSG.REPAIR_REMOTE:
       return repairRemote({ mode: msg.mode || 'repair', confirmOverwrite: !!msg.confirmOverwrite });
 
+    case MSG.DEDUPE_REMOTE:
+      return repairRemote({ mode: 'dedupe', confirmOverwrite: true });
+
     case MSG.RESET_SYNC:
       return resetSyncState();
 

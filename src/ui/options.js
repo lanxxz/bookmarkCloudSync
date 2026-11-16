@@ -512,8 +512,50 @@ async function rebuildRemoteDoc() {
   }
 }
 
+async function dedupeRemoteDoc() {
+  if (
+    !confirm(
+      '用于"同一批书签被存成一式两份"的情况：\n' +
+        '同一层级下标题与网址完全相同的副本，只保留第一份，其余打墓碑（不是物理删除）。\n' +
+        '原始内容会先备份到 bcs-backup/。\n\n继续？'
+    )
+  )
+    return;
+  showHealth(['去重中…']);
+  try {
+    const r = await send(MSG.DEDUPE_REMOTE);
+    if (!r.ok) {
+      showHealth([...String(r.error).split('\n'), '', r.backup ? '原始内容已备份到 ' + r.backup : '', '可以先把上面「实际结构 / 文件开头」发给我。']);
+      toast('需要手动处理', 'warn');
+      return;
+    }
+    if (!r.removed) {
+      showHealth(['云端没有发现重复副本（' + r.nodes + ' 个节点），无需改动。', '备份：' + r.backup]);
+      toast('没有重复副本');
+      return;
+    }
+    const lines = [
+      '已清理重复副本：打墓碑 ' + r.removed + ' 个节点',
+      '剩余节点：' + r.nodes + '，云端版本 r' + r.revision,
+      '备份：' + r.backup,
+      '',
+      '—— 重复组（最多 20 条）——'
+    ];
+    for (const g of r.groups || []) {
+      lines.push('  · ' + (g.type === 'folder' ? '[文件夹] ' : '') + (g.title || '(无标题)') + ' ×' + g.copies);
+    }
+    if (r.groupCount > (r.groups || []).length) lines.push('  …共 ' + r.groupCount + ' 组');
+    lines.push('', '去重后请再点一次「立即同步」。');
+    showHealth(lines);
+    toast('已清理 ' + r.removed + ' 个重复节点');
+  } catch (err) {
+    showHealth(['去重失败：' + err.message]);
+  }
+}
+
 $('btn-inspect').addEventListener('click', inspectRemoteDoc);
 $('btn-repair').addEventListener('click', repairRemoteDoc);
+$('btn-dedupe').addEventListener('click', dedupeRemoteDoc);
 $('btn-rebuild').addEventListener('click', rebuildRemoteDoc);
 
 $('btn-snapshot').addEventListener('click', async () => {

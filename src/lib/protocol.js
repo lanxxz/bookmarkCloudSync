@@ -251,7 +251,7 @@ export function describeShape(data) {
   if (Array.isArray(data)) return 'array(' + data.length + ')';
   if (typeof data !== 'object') return typeof data;
   const parts = [];
-  for (const key of Object.keys(data).slice(0, 6)) {
+  for (const key of Object.keys(data).slice(0, 10)) {
     const v = data[key];
     const kind = Array.isArray(v) ? 'array(' + v.length + ')' : v === null ? 'null' : typeof v;
     parts.push(key + ':' + kind);
@@ -288,21 +288,136 @@ function repairShape(data) {
     return null;
   }
 
-  // 4. nodes 显式为 null / undefined
+  // 4. 整份文件被写成了 GitHub Contents API 的响应对象
+  //    { name, path, sha, size, url, html_url, content, encoding, ... }
+  //    content 是 base64 正文 —— 真数据还在里面，解开就能救回来。
+  //    必须排在 null-nodes 之前：这个对象没有 nodes 字段，否则会被误判成空文档。
+  if (isGithubApiResponse(data)) {
+    const inner = decodeGithubResponse(data);
+    if (inner) {
+      const nested = repairShape(inner);
+      const doc = nested ? nested.doc : inner;
+      if (doc && Array.isArray(doc.nodes)) return { doc, how: 'github-api-response' };
+    }
+  }
+
+  // 5. nodes 显式为 null / undefined
+  //    注意排除 GitHub 响应对象：它没有 nodes 字段，若在这里包成空文档，
+  //    validateDoc 就再也看不到"这是 API 响应"的事实了。
   if (data.nodes === null || data.nodes === undefined) {
     const rest = Object.keys(data).filter((k) => k !== 'nodes');
-    if (rest.length) return { doc: { ...data, nodes: [] }, how: 'null-nodes' };
+    if (rest.length && !isGithubApiResponse(data)) return { doc: { ...data, nodes: [] }, how: 'null-nodes' };
+  }
+
+  // 6. nodes 是正经数组，但 schemaVersion 缺失 / 是字符串 / 是坏值
+  //    数据本身完整（元素确实像书签节点），只是少了个版本号，补上即可。
+  if (Array.isArray(data.nodes) && (!Number.isFinite(data.schemaVersion) || typeof data.schemaVersion === 'string')) {
+    if (!data.nodes.length || data.nodes.some(looksLikeNode)) {
+      return { doc: { ...data, schemaVersion: SCHEMA_VERSION }, how: 'missing-schema' };
+    }
   }
 
   return null;
+}
+
+/** 像不像 GitHub Contents API 的文件响应（而不是我们的同步文档） */
+export function isGithubApiResponse(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+  if (Array.isArray(data.nodes)) return false; // 已经有 nodes，说明是我们的文档
+  const hasIdentity = typeof data.sha === 'string' && typeof data.path === 'string';
+  return hasIdentity && ('content' in data || 'encoding' in data || 'download_url' in data || 'git_url' in data);
+}
+
+/**
+ * 从 GitHub Contents API 响应里把真正的 JSON 正文解出来。
+ *
+ * 现场经验：content 不一定规规矩矩是"base64 包着我们的文档"。可能是
+ *   - 标准 base64 -> JSON；
+ *   - content 本身就是明文 JSON（有的工具直接把正文塞进去）；
+ *   - 二次嵌套：base64 里又是另一个 API 响应对象。
+ * 所以这里按可能性依次尝试，全部失败才返回 null。
+ */
+function decodeGithubResponse(data) {
+  const raw = typeof data.content === 'string' ? data.content : '';
+  if (!raw) return null;
+
+  const candidates = [];
+  const push = (s) => {
+    if (typeof s === 'string' && s.trim() && !candidates.includes(s)) candidates.push(s);
+  };
+
+  /* 1. 标准 base64（encoding 缺省时也按 base64 试） */
+  push(safeB64(raw));
+  /* 2. base64 解完再解一层（二次嵌套） */
+  const once = safeB64(raw);
+  if (once) push(safeB64(once));
+  /* 3. content 本身就是明文 JSON */
+  push(raw);
+
+  for (const text of candidates) {
+    const trimmed = String(text).trim();
+    if (trimmed[0] !== '{' && trimmed[0] !== '[') continue;
+    try {
+      const parsed = JSON.parse(stripBom(trimmed));
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      /* 换下一种 */
+    }
+  }
+  return null;
+}
+
+/** base64 -> utf8，失败返回空串（不抛） */
+function safeB64(s) {
+  try {
+    return decodeBase64Utf8(s);
+  } catch {
+    return '';
+  }
+}
+
+/** 只在没有 Buffer 的环境也能用的 base64 -> UTF-8（service worker / Node 均可） */
+function decodeBase64Utf8(b64) {
+  const clean = String(b64 || '').replace(/[\s\r\n]/g, '');
+  const bin = typeof atob === 'function'
+    ? atob(clean)
+    : Buffer.from(clean, 'base64').toString('binary');
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
 }
 
 export function validateDoc(data) {
   const errors = [];
   if (!data || typeof data !== 'object') return ['doc 不是对象'];
   if (Array.isArray(data)) return ['doc 是数组，不是对象'];
-  if (!Number.isFinite(data.schemaVersion)) errors.push('缺少 schemaVersion');
-  else if (data.schemaVersion > SCHEMA_VERSION) errors.push('云端 schemaVersion=' + data.schemaVersion + ' 高于本扩展支持的 ' + SCHEMA_VERSION + '，请升级扩展');
+  if (data.schemaVersion === undefined || data.schemaVersion === null) {
+    errors.push('缺少 schemaVersion（实际没有这个字段）');
+  } else if (typeof data.schemaVersion === 'string') {
+    errors.push("schemaVersion 是字符串（\"" + data.schemaVersion + '\"），应该是数字 ' + SCHEMA_VERSION);
+  } else if (!Number.isFinite(data.schemaVersion)) {
+    errors.push('schemaVersion 不是数字（实际是 ' + typeof data.schemaVersion + '）');
+  } else if (data.schemaVersion > SCHEMA_VERSION) {
+    errors.push('云端 schemaVersion=' + data.schemaVersion + ' 高于本扩展支持的 ' + SCHEMA_VERSION + '，请升级扩展');
+  }
+  if (isGithubApiResponse(data)) {
+    const raw = typeof data.content === 'string' ? data.content : '';
+    let why;
+    if (!('content' in data)) {
+      why = '缺少 content 字段';
+    } else if (!raw) {
+      /* GitHub 对 >1MB 的文件不返回内联内容：content 是空串、encoding 是 none。
+       * 说明这份文件是"被写坏之后"才被 API 抓取的快照，里面没有正文。 */
+      why = 'content 是空字符串（GitHub 对 >1MB 的文件不返回内联内容）';
+    } else {
+      why = 'content 长度 ' + raw.length + ' 字节，但解不出合法 JSON（可能被截断）';
+    }
+    errors.push(
+      '这份文件的内容是 GitHub Contents API 的响应对象（含 name/path/sha/url），不是同步文档：' + why +
+        '。当前文件里没有可恢复的书签数据'
+    );
+    return errors;
+  }
   if (!Array.isArray(data.nodes)) {
     errors.push('nodes 不是数组（实际是 ' + (data.nodes === null ? 'null' : typeof data.nodes) + '）');
   } else {
@@ -876,4 +991,280 @@ export function planLocalSummary(plan) {
     deletes: plan.deletes.length,
     notes: plan.notes.length
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * 身份对齐：新设备接入已有云端文档
+ *
+ * 为什么需要它：
+ *   同步层的 nodeId 是本机生成的，靠 state.mapping（nodeId <-> chromeId）保持稳定。
+ *   换浏览器 / 换设备 / 清空过 state 之后 mapping 是空的，同一批书签会拿到全新的 id。
+ *   此时 base 也是空的，三方合并会把「本地全量」和「云端全量」各自当成新增，
+ *   取并集 = 整棵树写两份（云端直接翻倍）。
+ *
+ *   节点 id 不稳定，但「类型 + 标题 + URL + 在树里的位置」是稳定的。
+ *   所以这里在合并之前，先按内容把本地节点认领成云端的 id，
+ *   之后的合并就是正常的三方合并，不会重复上传。
+ * ------------------------------------------------------------------ */
+
+/** 内容签名：文件夹看标题，书签看标题 + URL。与 id 无关，用于跨设备认亲。 */
+export function contentKey(node) {
+  if (!node) return '';
+  return node.type === NODE_TYPE.FOLDER
+    ? 'f\u0001' + (node.title || '')
+    : 'b\u0001' + (node.title || '') + '\u0001' + (node.url || '');
+}
+
+/**
+ * 每个节点的「路径签名」：从 root 到自己，把沿途 contentKey 串联起来。
+ * 签名只由标题/URL/层级决定，所以两份 id 不同、内容相同的树会算出完全一样的签名。
+ */
+export function pathKeys(index, { rootId = ROOT_NODE_ID } = {}) {
+  const memo = new Map();
+  const inFlight = new Set();
+  const keyOf = (id) => {
+    const cached = memo.get(id);
+    if (cached !== undefined) return cached;
+    const node = index.get(id);
+    if (!node) return '';
+    if (inFlight.has(id)) return ''; // 成环：退化成空签名，交给 repairTree 处理
+    inFlight.add(id);
+    const parentKey = node.parentId && node.parentId !== rootId ? keyOf(node.parentId) : '';
+    inFlight.delete(id);
+    const key = parentKey ? parentKey + '\u0002' + contentKey(node) : contentKey(node);
+    memo.set(id, key);
+    return key;
+  };
+  const out = new Map();
+  for (const id of index.keys()) out.set(id, keyOf(id));
+  return out;
+}
+
+/**
+ * 把本地节点的 id 认领成云端对应节点的 id。
+ *
+ * @returns {{index:Map, idRemap:Map<string,string>, adopted:number, reason:string}}
+ *   idRemap: 旧 nodeId -> 新 nodeId，调用方需要用它同步重写 mapping。
+ */
+export function adoptRemoteIdentities({ local, remote, rootId = ROOT_NODE_ID, minOverlapRatio = 0.1 } = {}) {
+  const l = local instanceof Map ? local : nodesToIndex(local);
+  const r = remote instanceof Map ? remote : nodesToIndex(remote);
+
+  let localActive = 0;
+  let remoteActive = 0;
+  let overlap = 0;
+  for (const node of l.values()) {
+    if (node.deleted) continue;
+    localActive++;
+    if (r.has(node.id) && !r.get(node.id).deleted) overlap++;
+  }
+  for (const node of r.values()) if (!node.deleted) remoteActive++;
+
+  const empty = { index: l, idRemap: new Map(), adopted: 0 };
+  if (!localActive || !remoteActive) return { ...empty, reason: 'one-side-empty' };
+
+  const ratio = overlap / Math.min(localActive, remoteActive);
+  if (ratio >= minOverlapRatio) return { ...empty, reason: 'already-aligned', ratio };
+
+  /* 云端候选池：路径签名 -> 未被占用的 id（按 index、id 稳定排序） */
+  const remoteKeys = pathKeys(r, { rootId });
+  const buckets = new Map();
+  for (const node of r.values()) {
+    if (node.deleted) continue;
+    const key = remoteKeys.get(node.id);
+    let arr = buckets.get(key);
+    if (!arr) {
+      arr = [];
+      buckets.set(key, arr);
+    }
+    arr.push(node.id);
+  }
+  for (const arr of buckets.values()) {
+    arr.sort((a, b) => r.get(a).index - r.get(b).index || (a < b ? -1 : a > b ? 1 : 0));
+  }
+
+  const localKeys = pathKeys(l, { rootId });
+  /* 父节点先认领，保证 parentId 重写时父链已经就位 */
+  const ordered = Array.from(l.values())
+    .filter((n) => !n.deleted)
+    .sort((a, b) => depthOf(l, a, rootId) - depthOf(l, b, rootId) || a.index - b.index || (a.id < b.id ? -1 : 1));
+
+  const idRemap = new Map();
+  for (const node of ordered) {
+    const parentOk = !node.parentId || node.parentId === rootId || idRemap.has(node.parentId);
+    if (!parentOk) continue; // 父节点没认领上，子节点也不认，避免把子节点挂到不存在的父上
+    const arr = buckets.get(localKeys.get(node.id));
+    if (!arr || !arr.length) continue;
+    idRemap.set(node.id, arr.shift());
+  }
+
+  const adopted = idRemap.size;
+  if (!adopted) return { ...empty, reason: 'no-content-match' };
+
+  const out = new Map();
+  for (const node of l.values()) {
+    const newId = idRemap.get(node.id) || node.id;
+    const mappedParent = node.parentId && node.parentId !== rootId ? idRemap.get(node.parentId) || node.parentId : node.parentId;
+    const next = { ...node, id: String(newId), parentId: mappedParent == null ? null : String(mappedParent) };
+    const remoteNode = r.get(next.id);
+    if (remoteNode) {
+      /* 顺序也采用云端的：新设备刚接入时本来就没有"本地顺序"的发言权，
+       * 沿用云端 index 可以避免一次性产生上千条假 move。 */
+      next.index = remoteNode.index;
+    }
+    out.set(next.id, next);
+  }
+  return { index: out, idRemap, adopted, reason: 'adopted', ratio };
+}
+
+/* ------------------------------------------------------------------ *
+ * 重复副本护栏
+ *
+ * 两个集合几乎没有共同 id、但内容高度重合 —— 这就是「同一批内容、两套 id」，
+ * 也就是整棵树被复制了一份。这时绝不能把并集写回云端。
+ * ------------------------------------------------------------------ */
+
+function activeContentCounts(index) {
+  const counts = new Map();
+  let total = 0;
+  for (const node of index.values()) {
+    if (node.deleted) continue;
+    total++;
+    const k = contentKey(node);
+    counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return { counts, total };
+}
+
+export function duplicateGuard({ merged, local, remote, settings = {} } = {}) {
+  const m = merged instanceof Map ? merged : nodesToIndex(merged || []);
+  const l = local instanceof Map ? local : nodesToIndex(local || []);
+  const r = remote instanceof Map ? remote : nodesToIndex(remote || []);
+
+  const la = activeContentCounts(l);
+  const ra = activeContentCounts(r);
+  const ma = activeContentCounts(m);
+
+  const idOverlapRatio = (() => {
+    const base = Math.min(la.total, ra.total);
+    if (!base) return 1;
+    let hit = 0;
+    for (const [id, node] of l) {
+      if (node.deleted) continue;
+      const other = r.get(id);
+      if (other && !other.deleted) hit++;
+    }
+    return hit / base;
+  })();
+
+  const contentOverlapRatio = (() => {
+    const base = Math.max(la.total, ra.total);
+    if (!base) return 1;
+    let hit = 0;
+    for (const [k, c] of la.counts) hit += Math.min(c, ra.counts.get(k) || 0);
+    return hit / base;
+  })();
+
+  const minSides = Number.isFinite(settings.identityMinSides) ? settings.identityMinSides : 5;
+  const maxIdOverlap = Number.isFinite(settings.identityMaxIdOverlap) ? settings.identityMaxIdOverlap : 0.05;
+  const minContentOverlap = Number.isFinite(settings.identityMinContentOverlap) ? settings.identityMinContentOverlap : 0.5;
+
+  const blocked =
+    la.total >= minSides && ra.total >= minSides && idOverlapRatio < maxIdOverlap && contentOverlapRatio > minContentOverlap;
+
+  let reason = '';
+  if (blocked) {
+    reason =
+      '本机与云端几乎没有任何共同节点（id 重合 ' + Math.round(idOverlapRatio * 100) + '%），' +
+      '但内容重合 ' + Math.round(contentOverlapRatio * 100) + '%：这是同一批书签用了两套 id，' +
+      '继续同步会把云端写成一式两份。请先在「云端文档健康」里执行「按内容去重」，再重新同步。';
+  }
+
+  return {
+    blocked,
+    reason,
+    localActive: la.total,
+    remoteActive: ra.total,
+    mergedActive: ma.total,
+    idOverlapRatio,
+    contentOverlapRatio
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 重复副本清理（只对"同一路径下内容完全相同"的节点动手）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 找出同一路径签名下的多个存活副本，保留一份、其余打墓碑。
+ *
+ * 为什么按路径签名分组：书签里同标题同 URL 的记录可能真的存在两条，
+ * 但「父子层级 + 标题 + URL」全同、且整棵子树都同，才是复制出来的副本。
+ * 顶层先处理：一旦整棵子树被判为副本，子树内节点随父一起下葬，不再单独判断。
+ */
+export function dedupeIndex(index, { rootId = ROOT_NODE_ID, now = Date.now(), deviceId = '' } = {}) {
+  const src = index instanceof Map ? index : nodesToIndex(index);
+  const keys = pathKeys(src, { rootId });
+
+  const childrenOf = new Map();
+  for (const [id, node] of src) {
+    if (!node.parentId) continue;
+    let arr = childrenOf.get(node.parentId);
+    if (!arr) {
+      arr = [];
+      childrenOf.set(node.parentId, arr);
+    }
+    arr.push(id);
+  }
+
+  const groups = new Map();
+  const depthOfId = new Map();
+  for (const [id, node] of src) {
+    if (node.deleted) continue;
+    depthOfId.set(id, depthOf(src, node, rootId));
+    const key = keys.get(id);
+    let arr = groups.get(key);
+    if (!arr) {
+      arr = [];
+      groups.set(key, arr);
+    }
+    arr.push(id);
+  }
+
+  const dropped = new Set();
+  const dropSubtree = (id) => {
+    const stack = [id];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (dropped.has(cur)) continue;
+      dropped.add(cur);
+      for (const child of childrenOf.get(cur) || []) stack.push(child);
+    }
+  };
+
+  const ordered = Array.from(groups.entries()).sort((a, b) => {
+    const da = depthOfId.get(a[1][0]) || 0;
+    const db = depthOfId.get(b[1][0]) || 0;
+    return da - db || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  });
+
+  const report = [];
+  for (const [, ids] of ordered) {
+    const alive = ids.filter((id) => !dropped.has(id));
+    if (alive.length < 2) continue;
+    alive.sort((a, b) => src.get(a).index - src.get(b).index || (a < b ? -1 : a > b ? 1 : 0));
+    const keep = alive[0];
+    for (const id of alive.slice(1)) dropSubtree(id);
+    report.push({ title: src.get(keep).title, type: src.get(keep).type, copies: alive.length, keep });
+  }
+
+  if (!dropped.size) return { index: src, removed: 0, groups: [], totalGroups: 0 };
+
+  const out = new Map(src);
+  for (const id of dropped) {
+    const node = src.get(id);
+    if (!node) continue;
+    out.set(id, makeNode({ ...node, deleted: true, deletedAt: now, updatedAt: Math.max(node.updatedAt || 0, now), deviceId: node.deviceId || deviceId }));
+  }
+  return { index: out, removed: dropped.size, groups: report, totalGroups: report.length };
 }

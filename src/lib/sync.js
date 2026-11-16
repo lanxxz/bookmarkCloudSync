@@ -34,10 +34,13 @@ import {
   isEmptyDiff,
   isEmptyPlan,
   filterExcluded,
-  buildBaseAfterPending
+  buildBaseAfterPending,
+  adoptRemoteIdentities,
+  duplicateGuard,
+  dedupeIndex
 } from './protocol.js';
 import { scanLocal, applyLocalPlan, refreshMapping, resolveRootParent, clearRootParentCache, clearLocalBookmarks } from './local.js';
-import { backendFor, isConflict, resolveToken, backendStatus, peekTokenFor } from './storage/index.js';
+import { backendFor, isConflict, resolveToken, backendStatus, peekTokenFor, BACKENDS } from './storage/index.js';
 import { describeShape } from './protocol.js';
 import { getSettings } from './auth.js';
 import { getIdbState, setIdbState, pruneLocalSnapshots } from './idb.js';
@@ -212,7 +215,28 @@ export async function readRemote({ token, settings } = {}) {
   if (!res.exists) {
     return { exists: false, doc: null, fileId: '', etag: '', name: cfg.path, backend: backendName };
   }
-  const parsed = docFromJson(res.text);
+  let parsed = docFromJson(res.text);
+
+  /* 云端当前版本读不出来时，先去 git 历史里捞最后一个能解析的版本。
+   * GitHub 模式下每次同步都是一个 commit，数据几乎总能捞回来；
+   * 捞到了就当作"云端当前内容"继续走正常合并，用户不需要手动做事。 */
+  let recovered = null;
+  if (!parsed.ok && backendName === BACKENDS.GITHUB) {
+    recovered = await recoverFromHistory({ backend, cfg, token, backendName }).catch((err) => {
+      logger.warn('回溯 git 历史失败：' + err.message);
+      return null;
+    });
+    if (recovered) {
+      parsed = docFromJson(recovered.text);
+      if (parsed.ok) {
+        logger.warn(
+          '云端当前版本（' + String(res.version || '').slice(0, 10) + '）已损坏，' +
+            '已自动回溯到 commit ' + recovered.sha.slice(0, 10) + '（' + (recovered.message || '') + '）并继续同步'
+        );
+      }
+    }
+  }
+
   if (!parsed.ok) {
     /*
      * 这里的报错必须能自解释。
@@ -222,9 +246,17 @@ export async function readRemote({ token, settings } = {}) {
      * 并且用 RemoteCorruptError 单独标记，让上层能给出修复建议。
      */
     const detail = (parsed.errors || []).join('；') || parsed.detail || '';
+    /* 内容里没有可恢复数据时，直接给出下一步，别让用户反复试点按钮 */
+    let hint = '';
+    if (/没有可恢复的书签数据/.test(detail)) {
+      hint =
+        '\n\n下一步：设置页 → 5. 云端文档健康 →「用本机重建」，' +
+        '把云端换成这台电脑的书签。云端旧内容已逐字节备份到 bcs-backup/。' +
+        '\n若想先找回更早的版本：设置页 → 6. 历史快照与恢复 →「云端快照」页签里能看到每次同步的 commit。';
+    }
     const err = new Error(
       '云端文档格式异常：' + (parsed.error || 'unknown') + (detail ? '（' + detail + '）' : '') +
-      (parsed.shape ? '\n实际结构：' + parsed.shape : '')
+      (parsed.shape ? '\n实际结构：' + parsed.shape : '') + hint
     );
     err.code = 'REMOTE_CORRUPT';
     err.detail = { error: parsed.error, errors: parsed.errors, shape: parsed.shape, preview: parsed.preview, path: cfg.path };
@@ -238,12 +270,48 @@ export async function readRemote({ token, settings } = {}) {
     exists: true,
     doc: parsed.doc,
     fileId: res.fileId || '',
-    etag: res.version || '',
+    /* 用了历史版本时，乐观锁必须用那个版本的 sha，否则写回必然 409 */
+    etag: recovered ? recovered.blobSha || res.version || '' : res.version || '',
     name: cfg.path,
     backend: backendName,
-    raw: res.text,
-    repaired: parsed.repaired || ''
+    raw: recovered ? recovered.text : res.text,
+    repaired: parsed.repaired || '',
+    recoveredFrom: recovered ? { sha: recovered.sha, blobSha: recovered.blobSha, message: recovered.message } : null
   };
+}
+
+/**
+ * 从 commit 历史里找最后一个能解析的文档版本。
+ *
+ * 只在"当前版本读不出来"时调用，从新到旧最多翻 30 个 commit。
+ * 找到就返回它的正文 + blob sha；全都不行返回 null。
+ */
+async function recoverFromHistory({ backend, cfg, token }) {
+  if (typeof backend.listCommits !== 'function' || typeof backend.readAtVersion !== 'function') return null;
+  const commits = await backend.listCommits(cfg, cfg.path, { token, limit: 30 });
+  if (!Array.isArray(commits) || !commits.length) return null;
+
+  for (const c of commits) {
+    const sha = c && c.sha;
+    if (!sha) continue;
+    try {
+      const version = await backend.readAtVersion(cfg, { commit: sha, token });
+      if (!version || !version.text) continue;
+      const probe = docFromJson(version.text);
+      if (!probe.ok) continue;
+      return {
+        sha,
+        /* 写回时 GitHub 要的是 blob sha，不是 commit sha。
+         * readAtVersion 返回的 version 就是该 commit 下这个 blob 的 sha。 */
+        blobSha: version.version || '',
+        text: version.text,
+        message: (c.commit && c.commit.message ? c.commit.message.split('\n')[0] : '').slice(0, 60)
+      };
+    } catch {
+      /* 单个 commit 读失败不影响继续往前翻 */
+    }
+  }
+  return null;
 }
 
 /**
@@ -282,6 +350,34 @@ export async function inspectRemote({ token, settings } = {}) {
 }
 
 /**
+ * 用户已明确确认的覆盖写（repair / dedupe / rebuild）。
+ *
+ * 这三条路径都是"用户点了确认、就是要覆盖"，所以遇到并发冲突不该直接失败：
+ * 重新读一次最新的 sha，再写一遍，最多 3 轮。
+ * 真正的数据保护靠前面的逐字节备份，而不是靠 sha 失败。
+ */
+async function writeDocForced({ backend, cfg, text, token, message, attempts = 3 }) {
+  let lastErr = null;
+  let version = '';
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (!version) {
+        const fresh = await backend.readDoc(cfg, { token });
+        version = fresh.exists ? fresh.version || '' : '';
+      }
+      return await backend.writeDoc(cfg, text, { token, version: version || undefined, message });
+    } catch (err) {
+      lastErr = err;
+      if (!isConflict(err) || i === attempts - 1) throw err;
+      logger.warn('云端在修复过程中被更新，重新读取 sha 后重试（第 ' + (i + 1) + ' 次）');
+      version = '';
+      await new Promise((r) => setTimeout(r, 200 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * 修复云端文档（带备份）。
  *
  * 三种处置：
@@ -312,7 +408,8 @@ export async function repairRemote({ token, settings, mode = 'repair', confirmOv
     );
     logger.warn('已备份损坏文档到 ' + backupName);
   } catch (err) {
-    logger.warn('备份损坏文档失败（继续尝试修复）', err);
+    /* 备份失败不能阻断修复，但要说清楚是真失败还是同名文件已存在 */
+    logger.warn('备份损坏文档失败（继续尝试修复）：' + err.message, err);
   }
 
   const parsed = docFromJson(res.text);
@@ -322,8 +419,12 @@ export async function repairRemote({ token, settings, mode = 'repair', confirmOv
     if (!parsed.ok) {
       return {
         ok: false,
-        error: '无法自动修复：' + ((parsed.errors || []).join('；') || parsed.error),
+        error:
+          '无法自动修复：' + ((parsed.errors || []).join('；') || parsed.error) +
+          '\n实际结构：' + (parsed.shape || '未知') +
+          '\n文件开头：' + String(res.text || '').slice(0, 200),
         backup: backupName,
+        shape: parsed.shape || '',
         needRebuild: true
       };
     }
@@ -333,13 +434,78 @@ export async function repairRemote({ token, settings, mode = 'repair', confirmOv
       writer: state?.deviceId || '',
       createdAt: parsed.doc.createdAt || Date.now()
     });
-    await backend.writeDoc(cfg, serializeDoc(doc), {
+    await writeDocForced({
+      backend,
+      cfg,
+      text: serializeDoc(doc),
       token: token2,
-      version: res.version,
       message: 'fix(bcs): normalize document structure r' + doc.revision
     });
     logger.success('云端文档已归一化写回（r' + doc.revision + '，' + doc.nodes.length + ' 个节点）');
     return { ok: true, mode, backup: backupName, revision: doc.revision, nodes: doc.nodes.length, repaired: parsed.repaired || '' };
+  }
+
+  /* 2.5) dedupe：云端能解析，但同一批书签被存成了一式两份 -> 按内容去重 */
+  if (mode === 'dedupe') {
+    if (!parsed.ok) {
+      /* 报错必须能自证：带上实际结构 + 出错位置的前 200 字符，否则用户无法判断该怎么办 */
+      const shape = parsed.shape || (() => {
+        try {
+          return describeShape(JSON.parse(res.text));
+        } catch {
+          return '不是合法 JSON';
+        }
+      })();
+      const head = String(res.text || '').slice(0, 200);
+      return {
+        ok: false,
+        error:
+          '云端文档无法解析，不能按内容去重：' + ((parsed.errors || []).join('；') || parsed.error) +
+          '\n实际结构：' + shape +
+          '\n文件大小：' + String(res.text || '').length + ' 字节' +
+          '\n文件开头：' + head,
+        backup: backupName,
+        shape,
+        size: String(res.text || '').length,
+        head
+      };
+    }
+    if (!confirmOverwrite) {
+      return { ok: false, error: 'dedupe 会改写云端内容，需要 confirmOverwrite=true', backup: backupName };
+    }
+    const before = docStats(parsed.doc);
+    const deduped = dedupeIndex(parsed.doc.nodes, { now: Date.now(), deviceId: state?.deviceId || '' });
+    if (!deduped.removed) {
+      return { ok: true, mode, backup: backupName, removed: 0, nodes: before.total, revision: parsed.doc.revision, groups: [] };
+    }
+    const doc = createDoc({
+      nodes: deduped.index,
+      revision: Math.max(1, (parsed.doc.revision || 0) + 1),
+      writer: state?.deviceId || '',
+      createdAt: parsed.doc.createdAt || Date.now()
+    });
+    await writeDocForced({
+      backend,
+      cfg,
+      text: serializeDoc(doc),
+      token: token2,
+      message: 'fix(bcs): dedupe duplicated bookmarks r' + doc.revision
+    });
+    /* 云端变了，本机 base 里还是旧的双份树 —— 清空 base，让下一轮按内容重新对齐 */
+    if (state) {
+      await saveState({ ...state, baseIndex: new Map(), revision: doc.revision, etag: '', pending: null, lastError: '' }).catch(() => {});
+    }
+    logger.success('云端重复副本已清理：打墓碑 ' + deduped.removed + ' 个节点（原 ' + before.total + '）');
+    return {
+      ok: true,
+      mode,
+      backup: backupName,
+      revision: doc.revision,
+      removed: deduped.removed,
+      nodes: doc.nodes.length,
+      groups: deduped.groups.slice(0, 20),
+      groupCount: deduped.totalGroups
+    };
   }
 
   /* 3. rebuild：用本机书签重建 */
@@ -351,7 +517,12 @@ export async function repairRemote({ token, settings, mode = 'repair', confirmOv
     const local = await scanLocal({ mapping: state?.mapping, deviceId });
     const nodes = normalizeIndices(local.nodes);
     const doc = createDoc({ nodes, revision: Math.max(1, (parsed.ok ? parsed.doc.revision : 0) + 1), writer: deviceId });
-    await backend.writeDoc(cfg, serializeDoc(doc), {
+    /* 必须带 sha：GitHub 更新已存在文件时要求提供 blob sha，
+     * 不带会被 422 拒绝，而错误文案里的 "sha" 又会被误判成并发冲突。 */
+    await writeDocForced({
+      backend,
+      cfg,
+      text: serializeDoc(doc),
       token: token2,
       message: 'fix(bcs): rebuild document from local bookmarks r' + doc.revision
     });
@@ -445,9 +616,17 @@ export async function previewSync({ token, settings } = {}) {
   const state = (await loadState()) || { ...defaultState(await ensureDeviceId()), baseIndex: new Map(), mapping: new Map() };
 
   const local = await scanLocal({ mapping: state.mapping, deviceId: state.deviceId });
-  const localIndex = filterExcluded(stampLocalChanges(normalizeIndices(local.nodes), state.seen).index, s.excludeFolders);
+  let localIndex = filterExcluded(stampLocalChanges(normalizeIndices(local.nodes), state.seen).index, s.excludeFolders);
   const remote = await readRemote({ token: auth, settings: s });
   const remoteIndex = filterExcluded(remote.exists ? remote.doc.nodes : new Map(), s.excludeFolders);
+
+  /* 与 sync() 完全一致：先把本机 id 对齐到云端，否则预览会显示"整棵树新增一遍"的假象 */
+  let mapping = local.mapping;
+  let aligned = null;
+  if (remote.exists) {
+    aligned = adoptRemoteIdentities({ local: localIndex, remote: remoteIndex });
+    if (aligned.adopted) localIndex = aligned.index;
+  }
 
   const base = filterExcluded(state.baseIndex instanceof Map ? state.baseIndex : new Map(), s.excludeFolders);
   const result = mergeDocs({
@@ -459,7 +638,8 @@ export async function previewSync({ token, settings } = {}) {
   });
 
   const mergedIndex = normalizeIndices(result.merged);
-  const plan = planLocalApply({ merged: mergedIndex, local: localIndex, chromeIdOf: local.mapping });
+  const dup = duplicateGuard({ merged: mergedIndex, local: localIndex, remote: remoteIndex, settings: s });
+  const plan = planLocalApply({ merged: mergedIndex, local: localIndex, chromeIdOf: mapping });
   const summary = planLocalSummary(plan);
   const guard = deleteGuard(plan, s, countActive(localIndex));
 
@@ -474,6 +654,8 @@ export async function previewSync({ token, settings } = {}) {
     conflicts: result.conflicts.slice(0, 50),
     conflictCount: result.conflicts.length,
     guard,
+    duplicate: dup,
+    alignedNodes: aligned ? aligned.adopted : 0,
     wouldChange: !isEmptyPlan(summary) || !isEmptyDiff(diffSummary(mergedIndex, remoteIndex)),
     preview: {
       creates: plan.creates.slice(0, 20).map((c) => ({ title: c.title, url: c.url, type: c.type })),
@@ -505,11 +687,35 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
     /* 1) 扫描本地，并给"相对上次同步有变化"的节点盖时间戳 */
     const local = await scanLocal({ mapping: state.mapping, deviceId });
     const stamped = stampLocalChanges(normalizeIndices(local.nodes), state.seen);
-    const localIndex = filterExcluded(stamped.index, s.excludeFolders);
+    let localIndex = filterExcluded(stamped.index, s.excludeFolders);
     const localHash = hashTree(localIndex);
 
     /* 2) 读取云端 */
     let remote = await readRemote({ token: auth, settings: s });
+
+    /* 2.5) 身份对齐：新设备/清空过 state 时，本机 nodeId 与云端 nodeId 完全不同，
+     *      base 又是空的，直接合并会把整棵树写成两份。先按内容认领云端的 id。 */
+    let mapping = local.mapping;
+    let seen = stamped.seen;
+    if (remote.exists) {
+      const remoteForAlign = filterExcluded(remote.doc.nodes, s.excludeFolders);
+      const align = adoptRemoteIdentities({ local: localIndex, remote: remoteForAlign });
+      if (align.adopted) {
+        localIndex = align.index;
+        mapping = new Map();
+        for (const [nodeId, chromeId] of local.mapping) {
+          mapping.set(align.idRemap.get(nodeId) || nodeId, chromeId);
+        }
+        seen = {};
+        for (const [nodeId, rec] of Object.entries(stamped.seen || {})) {
+          seen[align.idRemap.get(nodeId) || nodeId] = rec;
+        }
+        clearRootParentCache();
+        logger.info('本机书签已按内容对齐到云端节点：认领 ' + align.adopted + ' 个（' + align.reason + '）');
+      } else if (align.reason === 'no-content-match') {
+        logger.debug('身份对齐：内容无交集，按新书签处理');
+      }
+    }
 
     /* 3) 首次引导：云端没有文档 -> 用本地树建立初始文档 */
     if (!remote.exists) {
@@ -560,6 +766,39 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
         durationMs: Date.now() - startedAt,
         reason
       };
+    }
+
+    /* 3.5) 重复副本护栏：几乎无共同 id 但内容高度重合 = 同一批书签两套 id。
+     *      这种情况合并结果一定是"一份变两份"，绝不能写回云端。 */
+    {
+      const remoteForGuard = filterExcluded(remote.doc.nodes, s.excludeFolders);
+      const dup = duplicateGuard({ merged: localIndex, local: localIndex, remote: remoteForGuard, settings: s });
+      if (dup.blocked) {
+        logger.warn(dup.reason);
+        await saveState({
+          ...state,
+          deviceId,
+          fileId: remote.fileId,
+          revision: remote.doc.revision,
+          lastSyncAt: Date.now(),
+          lastLocalHash: localHash,
+          baseIndex: state.baseIndex instanceof Map ? state.baseIndex : new Map(),
+          mapping,
+          seen,
+          pending: null,
+          conflicts: [],
+          stats: null,
+          lastError: dup.reason
+        });
+        return {
+          ok: false,
+          blocked: true,
+          reason: 'duplicate-copies',
+          message: dup.reason,
+          guard: dup,
+          durationMs: Date.now() - startedAt
+        };
+      }
     }
 
     /* 4) 三方合并（带重试：云端被别的设备抢先写入时重来） */
@@ -627,7 +866,7 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
     if (!mergedIndex) throw new Error('合并失败：未生成结果');
 
     /* 6) 应用到本地 */
-    const plan = planLocalApply({ merged: mergedIndex, local: localIndex, chromeIdOf: local.mapping });
+    const plan = planLocalApply({ merged: mergedIndex, local: localIndex, chromeIdOf: mapping });
     const guard = deleteGuard(plan, s, countActive(localIndex));
 
     if (guard.blocked) {
@@ -641,8 +880,8 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
         lastSyncAt: Date.now(),
         lastLocalHash: localHash,
         baseIndex: state.baseIndex instanceof Map ? state.baseIndex : new Map(),
-        mapping: local.mapping,
-        seen: stamped.seen,
+        mapping,
+        seen,
         pending: {
           createdAt: Date.now(),
           reason: guard.reason,
@@ -677,10 +916,10 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
       };
     }
 
-    let applied = { created: 0, updated: 0, moved: 0, deleted: 0, errors: [], mapping: local.mapping };
+    let applied = { created: 0, updated: 0, moved: 0, deleted: 0, errors: [], mapping };
     if (!isEmptyPlan(planLocalSummary(plan))) {
       await saveLocalSnapshot({ index: localIndex, kind: SNAPSHOT_KIND.PRE_SYNC, deviceId, reason: '应用本地变更前' });
-      applied = await applyLocalPlan({ plan, mapping: local.mapping, deviceId, protectedIds: local.protectedIds });
+      applied = await applyLocalPlan({ plan, mapping, deviceId, protectedIds: local.protectedIds });
     }
 
     /* 7) 收尾：重新扫描，保证映射/newBase 与真实状态一致 */

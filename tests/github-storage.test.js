@@ -37,7 +37,7 @@ function installFetch(routes) {
 }
 
 const { readFile, writeFile, headFile, listDir, listCommits, cfgFromSettings } = await import('../src/lib/storage/github.js');
-const { StorageError } = await import('../src/lib/storage/base.js');
+const { StorageError, isConflict } = await import('../src/lib/storage/base.js');
 
 test('readFile 解出 UTF-8 中文内容', async () => {
   installFetch({
@@ -161,4 +161,88 @@ test('cfgFromSettings 缺仓库时抛 NOT_CONFIGURED', () => {
   const cfg = cfgFromSettings({ githubOwner: 'me', githubRepo: 'bm', githubBranch: '', githubPath: '' });
   assert.equal(cfg.branch, 'main');
   assert.equal(cfg.path, 'bookmarks.json');
+});
+
+test('写文件时缺 sha 报 SHA_MISSING，而不是 CONFLICT', async () => {
+  installFetch({
+    'PUT /repos/me/bookmarks/contents/bookmarks.json': () =>
+      jsonRes({ message: 'Invalid request.\n\n"sha" wasn\'t supplied.' }, { status: 422 })
+  });
+  await assert.rejects(
+    () => writeFile(CFG, 'bookmarks.json', '{}', { token: TOKEN }),
+    (err) => {
+      assert.equal(err.code, 'SHA_MISSING');
+      assert.equal(isConflict(err), false, '不能进并发重试分支');
+      assert.match(err.message, /没有提供 sha/);
+      return true;
+    }
+  );
+});
+
+test('写文件时 sha 不匹配仍报 CONFLICT', async () => {
+  installFetch({
+    'PUT /repos/me/bookmarks/contents/bookmarks.json': () =>
+      jsonRes({ message: 'bookmarks.json does not match 1111111' }, { status: 409 })
+  });
+  await assert.rejects(
+    () => writeFile(CFG, 'bookmarks.json', '{}', { token: TOKEN, version: 'wrong' }),
+    (err) => {
+      assert.equal(err.code, 'CONFLICT');
+      assert.equal(isConflict(err), true);
+      return true;
+    }
+  );
+});
+
+test('带 sha 的写入会被请求体携带（GitHub 更新文件的硬性要求）', async () => {
+  let seen = null;
+  installFetch({
+    'PUT /repos/me/bookmarks/contents/bookmarks.json': (init) => {
+      seen = JSON.parse(init.body);
+      return jsonRes({ content: { sha: 'newsha' }, commit: { sha: 'c1' } });
+    }
+  });
+  const res = await writeFile(CFG, 'bookmarks.json', '{"a":1}', { token: TOKEN, version: 'oldsha' });
+  assert.equal(seen.sha, 'oldsha');
+  assert.equal(res.version, 'newsha');
+});
+
+test('readFile 自动解包"文件内容是 API 响应对象"的情况', async () => {
+  const inner = Buffer.from(JSON.stringify(DOC), 'utf8').toString('base64');
+  const apiResp = {
+    name: 'bookmarks.json', path: 'bookmarks.json', sha: 'sha-1', size: 500,
+    url: 'u', html_url: 'h', git_url: 'g', download_url: 'd', type: 'file',
+    content: inner, encoding: 'base64'
+  };
+  installFetch({
+    'GET /repos/me/bookmarks/contents/bookmarks.json': () =>
+      jsonRes({
+        sha: 'sha-1', size: 900, encoding: 'base64',
+        content: Buffer.from(JSON.stringify(apiResp), 'utf8').toString('base64')
+      })
+  });
+  const res = await readFile(CFG, 'bookmarks.json', { token: TOKEN });
+  assert.equal(res.exists, true);
+  assert.equal(res.unwrapped, true, '应标记已解包');
+  const doc = JSON.parse(res.text);
+  assert.equal(doc.schemaVersion, 2);
+  assert.equal(doc.nodes[0].title, '中文书签');
+});
+
+test('readFile 遇到 content 为空壳时原样返回，不假装成功', async () => {
+  const apiResp = {
+    name: 'bookmarks.json', path: 'bookmarks.json', sha: 'sha-1', size: 900,
+    url: 'u', html_url: 'h', git_url: 'g', download_url: 'd', type: 'file',
+    content: '', encoding: 'none'
+  };
+  installFetch({
+    'GET /repos/me/bookmarks/contents/bookmarks.json': () =>
+      jsonRes({
+        sha: 'sha-1', size: 900, encoding: 'base64',
+        content: Buffer.from(JSON.stringify(apiResp), 'utf8').toString('base64')
+      })
+  });
+  const res = await readFile(CFG, 'bookmarks.json', { token: TOKEN });
+  assert.equal(res.unwrapped, false);
+  assert.equal(JSON.parse(res.text).content, '');
 });

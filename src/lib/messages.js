@@ -30,5 +30,6 @@ export const MSG = Object.freeze({
   BACKEND_SET: 'backend-set',
   BACKEND_STATUS: 'backend-status',
   REPAIR_REMOTE: 'repair-remote',
+  DEDUPE_REMOTE: 'dedupe-remote',
   REMOTE_INSPECT: 'remote-inspect'
 });

@@ -47,6 +47,10 @@ export const DEFAULT_SETTINGS = {
   maxAutoDeletes: 50,
   maxAutoDeleteRatio: 0.25,
   tombstoneDays: 90,
+  /* 身份对齐 / 重复副本护栏：判定"同一批书签用了两套 id"的阈值 */
+  identityMinSides: 5,
+  identityMaxIdOverlap: 0.05,
+  identityMinContentOverlap: 0.5,
   includeOtherBookmarks: true,
   excludeFolders: [],
   verbose: false
