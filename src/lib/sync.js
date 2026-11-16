@@ -35,11 +35,11 @@ import {
   filterExcluded,
   buildBaseAfterPending
 } from './protocol.js';
-import { scanLocal, applyLocalPlan, refreshMapping, resolveRootParent, clearRootParentCache } from './local.js';
-import { backendFor, isConflict, resolveToken } from './storage/index.js';
+import { scanLocal, applyLocalPlan, refreshMapping, resolveRootParent, clearRootParentCache, clearLocalBookmarks } from './local.js';
+import { backendFor, isConflict, resolveToken, backendStatus, peekTokenFor } from './storage/index.js';
 import { getSettings } from './auth.js';
 import { getIdbState, setIdbState, pruneLocalSnapshots } from './idb.js';
-import { saveLocalSnapshot, saveRemoteSnapshot, SNAPSHOT_KIND } from './history.js';
+import { saveLocalSnapshot, saveRemoteSnapshot, loadSnapshotNodes, SNAPSHOT_KIND } from './history.js';
 import { hashString, now as nowFn, randomId } from './util.js';
 
 const STATE_KEY = 'sync-state';
@@ -659,7 +659,6 @@ export function hashTree(index) {
 export async function getStatus() {
   const state = await loadState();
   const s = await getSettings();
-  const { backendStatus, peekTokenFor } = await import('./storage/index.js');
   const backend = await backendStatus(s);
   const token = await peekTokenFor(s);
   const connected = !!(backend.configured && token);
@@ -718,8 +717,6 @@ export async function getStatus() {
  *  3. 清空同步基线，下一次 sync 会以恢复后的本地树为准重新合并。
  */
 export async function restoreSnapshot({ source = 'local', id, token, mode = 'replace' } = {}) {
-  const { loadSnapshotNodes } = await import('./history.js');
-  const { clearLocalBookmarks } = await import('./local.js');
   const s = await getSettings();
   const deviceId = await ensureDeviceId();
   const auth = token || (await resolveToken(s));

@@ -16,6 +16,7 @@ import {
 } from '../drive.js';
 import { StorageError, fromBase64Utf8 } from './base.js';
 import { HISTORY_DIR_NAME } from '../drive.js';
+import { requireToken } from '../auth.js';
 
 export const KIND = 'drive';
 
@@ -109,7 +110,6 @@ async function ensureHistoryFolder({ token }) {
 }
 
 async function uploadToFolder(folderId, name, content, { token }) {
-  const { requireToken } = await import('../auth.js');
   const auth = token || (await requireToken());
   const boundary = 'bcs' + Math.random().toString(36).slice(2);
   const meta = { name, parents: [folderId], mimeType: 'application/json' };

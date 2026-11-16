@@ -12,6 +12,7 @@
 import * as driveBackend from './drive.js';
 import * as githubBackend from './github.js';
 import { StorageError } from './base.js';
+import { requireToken, peekToken } from '../auth.js';
 
 export { StorageError, isConflict, isAuthError } from './base.js';
 export const BACKENDS = Object.freeze({ DRIVE: 'drive', GITHUB: 'github' });
@@ -73,22 +74,14 @@ export async function backendStatus(settings) {
  */
 export async function resolveToken(settings) {
   const name = resolveBackend(settings);
-  if (name === BACKENDS.GITHUB) {
-    const { requireGithubToken } = await import('./github.js');
-    return requireGithubToken();
-  }
-  const { requireToken } = await import('../auth.js');
+  if (name === BACKENDS.GITHUB) return githubBackend.requireGithubToken();
   return requireToken();
 }
 
 /** 只探测有没有凭证，不发起授权 */
 export async function peekTokenFor(settings) {
   const name = resolveBackend(settings);
-  if (name === BACKENDS.GITHUB) {
-    const { getGithubToken } = await import('./github.js');
-    return getGithubToken();
-  }
-  const { peekToken } = await import('../auth.js');
+  if (name === BACKENDS.GITHUB) return githubBackend.getGithubToken();
   const t = await peekToken();
   return t ? t.accessToken : '';
 }
