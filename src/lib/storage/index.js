@@ -17,6 +17,33 @@ import { requireToken, peekToken } from '../auth.js';
 export { StorageError, isConflict, isAuthError } from './base.js';
 export const BACKENDS = Object.freeze({ DRIVE: 'drive', GITHUB: 'github' });
 
+/**
+ * 后端必须实现的全部方法。
+ *
+ * 这份清单不是文档，而是被 tests/storage-contract.test.js 实际使用的断言源：
+ * 任何一个后端漏实现一个方法，测试立刻红。
+ *
+ * 起因：GitHub 后端最早只有 readFile/writeFile 这套底层名字，
+ * 而 sync.js 调的是统一接口 readDoc —— 于是运行时报
+ * "backend.readDoc is not a function"，静态检查完全看不出来。
+ */
+export const BACKEND_INTERFACE = Object.freeze([
+  'cfgFromSettings',
+  'readDoc',
+  'headDoc',
+  'writeDoc',
+  'saveSnapshot',
+  'listSnapshots',
+  'readSnapshot',
+  'pruneSnapshots',
+  'readAtVersion'
+]);
+
+/** 校验某个后端是否满足接口约定，返回缺失的方法名 */
+export function missingBackendMethods(backend) {
+  return BACKEND_INTERFACE.filter((name) => typeof backend[name] !== 'function');
+}
+
 /** GitHub 是后加的，所以老用户的 storage 里没有 backend 字段，默认走 drive 保持行为不变 */
 export function resolveBackend(settings) {
   const name = settings && settings.backend === BACKENDS.GITHUB ? BACKENDS.GITHUB : BACKENDS.DRIVE;
@@ -30,9 +57,23 @@ export function getBackend(name) {
 
 export function backendFor(settings) {
   const name = resolveBackend(settings);
-  return { name, backend: getBackend(name) };
+  const backend = getBackend(name);
+  /*
+   * 运行时兜底：契约测试是在 CI 里跑的，但用户装的是打包产物。
+   * 万一某个后端漏了方法，这里给出"缺哪个"的明确错误，
+   * 而不是让人对着 "xxx is not a function" 猜。
+   */
+  const missing = missingBackendMethods(backend);
+  if (missing.length) {
+    throw new StorageError(
+      '存储后端 ' + name + ' 缺少方法：' + missing.join(', ') + '（扩展包可能不完整，请重新安装）',
+      { code: 'BACKEND_INCOMPLETE', detail: { backend: name, missing } }
+    );
+  }
+  return { name, backend };
 }
 
+/** 后端展示名 */
 export function backendLabel(name) {
   return name === BACKENDS.GITHUB ? 'GitHub 私有仓库' : 'Google Drive';
 }

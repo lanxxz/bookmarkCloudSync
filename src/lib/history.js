@@ -16,7 +16,6 @@ import { putSnapshot, listSnapshots, pruneLocalSnapshots, getSnapshot, deleteSna
 import { getSettings } from './auth.js';
 import { formatTime } from './util.js';
 import { backendFor, BACKENDS } from './storage/index.js';
-import { GITHUB_HISTORY_DIR } from './storage/github.js';
 
 export const SNAPSHOT_KIND = Object.freeze({
   PRE_SYNC: 'pre-sync',       // 应用变更前
@@ -105,32 +104,27 @@ function snapshotPayload({ index, kind, deviceId, reason, revision }) {
 /**
  * 把一份快照写到"当前后端"。
  *
- * GitHub 模式有个额外好处：同步本身也会产生 commit，
- * 所以即便快照写失败，git 历史里也已经有可回滚的版本，不会丢数据。
+ * 只依赖统一接口（saveSnapshot / pruneSnapshots），不再按后端分支。
+ * GitHub 模式额外的好处：同步本身也产生 commit，即便快照写失败，
+ * git 历史里也已经有可回滚的版本。
  */
 export async function saveRemoteSnapshot({ index, kind, deviceId, reason = '', revision = 0, token, settings }) {
   try {
     const s = settings || (await getSettings());
-    const { name: backendName, backend } = backendFor(s);
+    const { backend } = backendFor(s);
     const cfg = backend.cfgFromSettings(s);
     const { ts, nodes, payload } = snapshotPayload({ index, kind, deviceId, reason, revision });
+    const name = snapshotFileName(ts, deviceId, kind);
 
-    if (backendName === BACKENDS.GITHUB) {
-      const fileName = GITHUB_HISTORY_DIR + '/' + snapshotFileName(ts, deviceId, kind);
-      const res = await backend.writeFile(cfg, fileName, JSON.stringify(payload), {
-        token,
-        message: 'chore(bcs): snapshot ' + kind + ' r' + revision
-      });
-      logger.info('已提交云端快照：' + fileName);
-      await pruneRemoteSnapshots({ token, settings: s, keep: s.historyKeep || 10 });
-      return { id: res.version, name: fileName, ts, count: nodes.length };
-    }
-
-    const fileName = snapshotFileName(ts, deviceId, kind);
-    const meta = await backend.saveSnapshot(cfg, { name: fileName, text: JSON.stringify(payload), token });
+    const meta = await backend.saveSnapshot(cfg, {
+      name,
+      text: JSON.stringify(payload),
+      token,
+      message: 'chore(bcs): snapshot ' + kind + ' r' + revision
+    });
+    logger.info('已保存云端快照：' + name);
     await pruneRemoteSnapshots({ token, settings: s, keep: s.historyKeep || 10 });
-    logger.info('已上传云端快照：' + fileName);
-    return { id: meta.id, name: fileName, ts, count: nodes.length };
+    return { id: meta.id, name, ts, count: nodes.length };
   } catch (err) {
     logger.warn('保存云端快照失败（不影响同步）', err);
     return null;
@@ -139,120 +133,81 @@ export async function saveRemoteSnapshot({ index, kind, deviceId, reason = '', r
 
 export async function pruneRemoteSnapshots({ token, settings, keep = 10 } = {}) {
   const s = settings || (await getSettings());
-  const { name: backendName, backend } = backendFor(s);
+  const { backend } = backendFor(s);
   const cfg = backend.cfgFromSettings(s);
-
-  if (backendName === BACKENDS.GITHUB) {
-    const files = await backend.listDir(cfg, GITHUB_HISTORY_DIR, { token });
-    const snaps = files
-      .filter((f) => f.type === 'file' && /^snap-.*\.json$/.test(f.name))
-      .sort((a, b) => (a.name < b.name ? 1 : -1));
-    const extra = snaps.slice(Math.max(1, keep));
-    let removed = 0;
-    for (const f of extra) {
-      try {
-        await backend.deleteFile(cfg, GITHUB_HISTORY_DIR + '/' + f.name, { token });
-        removed++;
-      } catch (err) {
-        logger.warn('删除旧快照失败 ' + f.name, err);
-      }
-    }
-    return { total: snaps.length, removed, kept: Math.min(snaps.length, keep) };
-  }
-
   return backend.pruneSnapshots(cfg, { token, keep });
 }
 
+/**
+ * 列出可恢复的云端版本。
+ *
+ * 两种后端都返回快照文件；GitHub 额外把"文档本身的 commit 历史"也列出来，
+ * 因为那边每次同步就是一个 commit，比快照更细。
+ */
 export async function listRemoteSnapshots({ token, settings } = {}) {
   const s = settings || (await getSettings());
   const { name: backendName, backend } = backendFor(s);
   const cfg = backend.cfgFromSettings(s);
 
-  if (backendName === BACKENDS.GITHUB) {
-    const [files, commits] = await Promise.all([
-      backend.listDir(cfg, GITHUB_HISTORY_DIR, { token }),
-      backend.listCommits(cfg, cfg.path, { token, limit: 30 })
-    ]);
-    const snaps = files
-      .filter((f) => f.type === 'file' && /^snap-.*\.json$/.test(f.name))
-      .map((f) => ({
-        id: GITHUB_HISTORY_DIR + '/' + f.name,
-        name: f.name,
-        size: Number(f.size || 0),
-        ts: 0,
-        time: '',
-        source: 'github',
-        kind: parseSnapshotKind(f.name)
-      }));
-    for (const snap of snaps) {
-      const m = snap.name.match(/^snap-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/);
-      if (m) {
-        const iso = m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + m[6] + 'Z';
-        snap.ts = Date.parse(iso) || 0;
-        snap.time = formatTime(snap.ts);
-      }
-    }
-    snaps.sort((a, b) => b.ts - a.ts);
-    // 文档本身的 commit 历史也是一条恢复路径，附在末尾
-    const docCommits = commits.map((c) => ({
-      id: 'commit:' + c.sha,
-      name: (c.commit && c.commit.message ? c.commit.message.split('\n')[0] : c.sha.slice(0, 8)).slice(0, 60),
-      size: 0,
-      ts: new Date((c.commit && c.commit.author && c.commit.author.date) || 0).getTime(),
-      time: formatTime(new Date((c.commit && c.commit.author && c.commit.author.date) || 0).getTime()),
-      source: 'github-commit',
-      kind: 'commit',
-      sha: c.sha
-    }));
-    return [...snaps, ...docCommits];
-  }
-
   const rows = await backend.listSnapshots(cfg, { token, limit: 60 });
-  return rows.map((f) => ({
+  const snaps = rows.map((f) => ({
     id: f.id,
     name: f.name,
     size: f.size,
     ts: f.ts,
     time: formatTime(f.ts),
-    source: 'drive',
+    source: backendName,
     kind: parseSnapshotKind(f.name)
   }));
+
+  if (backendName !== BACKENDS.GITHUB) return snaps;
+
+  const commits = await backend.listCommits(cfg, cfg.path, { token, limit: 30 }).catch(() => []);
+  const docCommits = commits.map((c) => {
+    const at = new Date((c.commit && c.commit.author && c.commit.author.date) || 0).getTime();
+    const msg = (c.commit && c.commit.message ? c.commit.message.split('\n')[0] : c.sha.slice(0, 8)).slice(0, 60);
+    return {
+      id: 'commit:' + c.sha,
+      name: msg,
+      size: 0,
+      ts: at,
+      time: formatTime(at),
+      source: 'github-commit',
+      kind: 'commit',
+      sha: c.sha
+    };
+  });
+  return [...snaps, ...docCommits];
 }
 
 export async function loadSnapshotNodes({ id, source, token, settings } = {}) {
   const s = settings || (await getSettings());
-  const { name: backendName, backend } = backendFor(s);
+  const { backend } = backendFor(s);
   const cfg = backend.cfgFromSettings(s);
 
   if (source === 'local') {
     const row = await getSnapshot(id);
     if (!row) throw new Error('本地快照不存在：' + id);
-    return { nodes: nodesToIndex(row.nodes), meta: { ts: row.ts, kind: row.kind, deviceId: row.deviceId, count: row.count } };
+    return {
+      nodes: nodesToIndex(row.nodes),
+      meta: { ts: row.ts, kind: row.kind, deviceId: row.deviceId, count: row.count }
+    };
   }
 
-  let text;
-  if (typeof source === 'string' && source.startsWith('github-commit')) {
-    // 从 commit 恢复：读该 commit 下的文档内容
-    const sha = id.startsWith('commit:') ? id.slice(7) : id;
-    const file = await backend.readFile(cfg, cfg.path, { token, ref: sha });
-    if (!file.exists) throw new Error('该 commit 里没有同步文档');
-    text = file.text;
-    const doc = JSON.parse(text);
-    if (!Array.isArray(doc.nodes)) throw new Error('文档缺少 nodes');
-    return { nodes: nodesToIndex(doc.nodes), meta: { ts: doc.updatedAt, kind: 'commit', deviceId: doc.writer, count: doc.nodes.length } };
+  // GitHub 的 commit 历史走 readAtVersion({ commit })
+  if (String(source).startsWith('github-commit') || String(id).startsWith('commit:')) {
+    const commit = String(id).startsWith('commit:') ? String(id).slice(7) : String(id);
+    const res = await backend.readAtVersion(cfg, { commit, token });
+    const doc = JSON.parse(res.text);
+    if (!Array.isArray(doc.nodes)) throw new Error('该版本缺少 nodes');
+    return {
+      nodes: nodesToIndex(doc.nodes),
+      meta: { ts: doc.updatedAt, kind: 'commit', deviceId: doc.writer, count: doc.nodes.length }
+    };
   }
 
-  if (backendName === BACKENDS.GITHUB) {
-    const rel = String(id).replace(/^\/+/, '');
-    const file = await backend.readFile(cfg, rel, { token });
-    if (!file.exists) throw new Error('快照不存在：' + rel);
-    text = file.text;
-  } else {
-    const res = await backend.readSnapshot(cfg, id, { token });
-    text = res.text;
-  }
-
-  const data = JSON.parse(text);
+  const res = await backend.readAtVersion(cfg, { id, token });
+  const data = JSON.parse(res.text);
   if (!Array.isArray(data.nodes)) throw new Error('快照文件缺少 nodes');
   return {
     nodes: nodesToIndex(data.nodes),

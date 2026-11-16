@@ -147,7 +147,7 @@ bookmarkCloudSync/
 │   └── ui/
 │       ├── popup.html/js/css  状态、立即同步、预览、待确认
 │       └── options.html/js/css 授权、参数、冲突策略、快照、自检、日志
-├── tests/                     106 个单元/仿真测试（node:test）
+├── tests/                     122 个单元/仿真测试（node:test）
 ├── tools/                     图标、扩展 key、校验、打包脚本
 │   └── verify-doc.mjs         独立文档校验器（可拷进书签仓库跑 CI）
 ├── templates/
@@ -222,7 +222,7 @@ bookmarkCloudSync/
 ## 六、开发与验证
 
 ~~~bash
-npm run test     # 106 个测试：合并语义、树修复、墓碑、删除保护、双设备收敛仿真、GitHub 后端契约、文档校验器、MV3 兼容性
+npm run test     # 122 个测试：合并语义、树修复、墓碑、删除保护、双设备收敛仿真、GitHub 后端契约、文档校验器、MV3 兼容性
 npm run check    # manifest 校验 + MV3 兼容性（动态 import/循环依赖/DOM 全局）+ 模块装载 + 未使用导入
 npm run icons    # 重新生成图标
 npm run key      # 重新生成扩展公钥（会改变扩展 ID）

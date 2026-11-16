@@ -256,6 +256,118 @@ export async function listDir(cfg, dir, { token } = {}) {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 统一存储接口
+ *
+ * 上层（sync / history / alarms / selftest）只认这一套名字。
+ * Drive 那边是原生实现，GitHub 这边是薄适配：把路径参数补上、
+ * 把返回字段对齐，避免上层再按后端分支。
+ *
+ * 接口清单见 storage/index.js 的 BACKEND_INTERFACE，
+ * 有契约测试保证两个后端都完整实现，漏一个就红。
+ * ------------------------------------------------------------------ */
+
+/** 读同步文档 */
+export async function readDoc(cfg, { token } = {}) {
+  const res = await readFile(cfg, cfg.path, { token });
+  if (!res.exists) return { exists: false };
+  return { exists: true, text: res.text, version: res.version, size: res.size };
+}
+
+/** 只取文档版本（sha），用于远端轮询 */
+export async function headDoc(cfg, { token } = {}) {
+  const head = await headFile(cfg, cfg.path, { token });
+  if (!head) return null;
+  return { sha: head.sha, size: head.size };
+}
+
+/**
+ * 写同步文档。
+ * version 是上次读到的 blob sha，带上去做乐观锁；
+ * 云端被别人改过时 GitHub 返回 409/422，这里透传 CONFLICT。
+ */
+export async function writeDoc(cfg, text, { token, version, message } = {}) {
+  const res = await writeFile(cfg, cfg.path, text, { token, version, message });
+  return { version: res.version, commit: res.commit, changed: true, message };
+}
+
+/* ---------------- 快照 ---------------- */
+
+/** 写一份快照到 bcs-history/ */
+export async function saveSnapshot(cfg, { name, text, token, message } = {}) {
+  const rel = GITHUB_HISTORY_DIR + '/' + name;
+  const res = await writeFile(cfg, rel, text, {
+    token,
+    message: message || 'chore(bcs): snapshot ' + name
+  });
+  return { id: rel, name, version: res.version };
+}
+
+/** 列出 bcs-history/ 下的快照，按文件名（含 ISO 时间）倒序 */
+export async function listSnapshots(cfg, { token, limit = 30 } = {}) {
+  const files = await listDir(cfg, GITHUB_HISTORY_DIR, { token });
+  const snaps = files
+    .filter((f) => f.type === 'file' && /^snap-.*\.json$/.test(f.name))
+    .map((f) => ({
+      id: GITHUB_HISTORY_DIR + '/' + f.name,
+      name: f.name,
+      size: Number(f.size || 0),
+      version: f.sha || '',
+      ts: parseSnapshotTs(f.name)
+    }));
+  snaps.sort((a, b) => b.ts - a.ts);
+  return snaps.slice(0, Math.max(1, limit));
+}
+
+/** 读一份快照的正文 */
+export async function readSnapshot(cfg, id, { token } = {}) {
+  const rel = String(id || '').replace(/^\/+/, '');
+  if (!/^[^/]+\/.+\.json$/.test(rel)) {
+    throw new StorageError('快照路径不合法：' + rel, { code: 'BAD_SNAPSHOT_PATH' });
+  }
+  const file = await readFile(cfg, rel, { token });
+  if (!file.exists) throw new StorageError('快照不存在：' + rel, { code: 'NOT_FOUND' });
+  return { text: file.text, version: file.version };
+}
+
+/** 环形裁剪：只保留最新的 keep 份 */
+export async function pruneSnapshots(cfg, { token, keep = 10 } = {}) {
+  const snaps = await listSnapshots(cfg, { token, limit: 10000 });
+  const extra = snaps.slice(Math.max(1, keep));
+  let removed = 0;
+  for (const snap of extra) {
+    try {
+      await deleteFile(cfg, snap.id, { token });
+      removed++;
+    } catch {
+      /* 单个失败不影响其它 */
+    }
+  }
+  return { total: snaps.length, removed, kept: Math.min(snaps.length, keep) };
+}
+
+/**
+ * 按版本读回内容。
+ *  - 传 id（快照路径）-> 读该快照文件
+ *  - 传 commit（sha）-> 读该 commit 下的同步文档
+ */
+export async function readAtVersion(cfg, { id, commit, token } = {}) {
+  if (commit) {
+    const file = await readFile(cfg, cfg.path, { token, ref: commit });
+    if (!file.exists) throw new StorageError('该 commit 里没有同步文档', { code: 'NOT_FOUND' });
+    return { text: file.text, version: file.version };
+  }
+  if (!id) throw new StorageError('缺少快照 id 或 commit', { code: 'NO_VERSION' });
+  return readSnapshot(cfg, id, { token });
+}
+
+/** 从 snap-2026-11-16T08-30-00-000Z_... 里解析出时间戳 */
+function parseSnapshotTs(name) {
+  const m = /^snap-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})/.exec(name);
+  if (!m) return 0;
+  return Date.parse(m[1] + '-' + m[2] + '-' + m[3] + 'T' + m[4] + ':' + m[5] + ':' + m[6] + 'Z') || 0;
+}
+
 /** 指定路径的提交历史 —— GitHub 模式下它就是"快照列表" */
 export async function listCommits(cfg, path, { token, limit = 30 } = {}) {
   const base = repoPath(cfg, '/commits');
