@@ -22,5 +22,11 @@ export const MSG = Object.freeze({
   RESET_SYNC: 'reset-sync',
   OPEN_OPTIONS: 'open-options',
   DEVICE_INFO: 'device-info',
-  SELF_TEST: 'self-test'
+  SELF_TEST: 'self-test',
+  GITHUB_CONNECT: 'github-connect',
+  GITHUB_DISCONNECT: 'github-disconnect',
+  GITHUB_STATUS: 'github-status',
+  GITHUB_REPOS: 'github-repos',
+  BACKEND_SET: 'backend-set',
+  BACKEND_STATUS: 'backend-status'
 });

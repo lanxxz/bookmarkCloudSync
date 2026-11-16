@@ -24,11 +24,18 @@ const REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
 /* ---------------- settings ---------------- */
 
 export const DEFAULT_SETTINGS = {
+  /* 存储后端：drive = Google Drive appDataFolder，github = GitHub 私有仓库 */
+  backend: 'drive',
   clientId: '',
   clientSecret: '',
   authMode: 'pkce', // pkce | implicit | manual
-  account: '', // 上次登录的邮箱，仅用于展示
+  account: '', // 上次登录的账号，仅用于展示
   driveFile: 'bookmarks.json',
+  /* GitHub 后端 */
+  githubOwner: '',
+  githubRepo: '',
+  githubBranch: 'main',
+  githubPath: 'bookmarks.json',
   historyKeep: 10,
   localHistoryKeep: 30,
   autoSync: true,

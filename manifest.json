@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bookmark Cloud Sync",
   "short_name": "BCS",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "把 Chrome / ego(lite) 书签双向同步到 Google Drive 私有 appDataFolder：删除前自动快照，冲突合并，一键恢复。",
   "minimum_chrome_version": "102",
   "permissions": [
@@ -16,7 +16,8 @@
   ],
   "host_permissions": [
     "https://www.googleapis.com/*",
-    "https://oauth2.googleapis.com/*"
+    "https://oauth2.googleapis.com/*",
+    "https://api.github.com/*"
   ],
   "background": {
     "service_worker": "src/background/service-worker.js",

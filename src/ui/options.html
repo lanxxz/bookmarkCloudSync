@@ -5,6 +5,7 @@
   <title>Bookmark Cloud Sync · 设置</title>
   <link rel="stylesheet" href="ui.css" />
   <link rel="stylesheet" href="options.css" />
+  <link rel="stylesheet" href="backend.css" />
 </head>
 <body>
 <div class="page">
@@ -28,7 +29,65 @@
   </div>
 
   <section class="card">
-    <h2>1. 账号授权</h2>
+    <h2>1. 选择云端存储</h2>
+    <div class="backend-grid">
+      <label class="backend-option" data-backend="github">
+        <input type="radio" name="backend" value="github" id="backend-github" />
+        <span class="backend-body">
+          <span class="backend-title">GitHub 私有仓库 <em class="tag-reco">推荐</em></span>
+          <span class="backend-desc">只需一个 fine-grained PAT。不依赖 chrome.identity，ego(lite) 也能用；每次同步就是一个 commit，历史可 checkout 回滚。</span>
+        </span>
+      </label>
+      <label class="backend-option" data-backend="drive">
+        <input type="radio" name="backend" value="drive" id="backend-drive" />
+        <span class="backend-body">
+          <span class="backend-title">Google Drive appDataFolder</span>
+          <span class="backend-desc">需要 Google Cloud OAuth 客户端。数据存在网盘私有隐藏目录，不混入普通文件。</span>
+        </span>
+      </label>
+    </div>
+    <p class="hint" id="backend-hint">两种后端互不影响，切换后请重新点「立即同步」；已有数据不会被删除。</p>
+  </section>
+
+  <section class="card" id="card-github">
+    <h2>2. GitHub 仓库</h2>
+    <div class="kv"><span>连接状态</span><b id="gh-state">未连接</b></div>
+    <div class="kv"><span>仓库</span><b id="gh-target">—</b></div>
+    <div class="kv"><span>分支 / 路径</span><b id="gh-branch">—</b></div>
+
+    <div class="grid2">
+      <label class="field">
+        <span>Fine-grained PAT（只需要 Contents: Read and write）</span>
+        <input id="gh-token" type="password" placeholder="github_pat_xxx" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="field">
+        <span>仓库（owner/repo）</span>
+        <input id="gh-repo" type="text" list="gh-repo-list" placeholder="yourname/bookmarks" autocomplete="off" spellcheck="false" />
+        <datalist id="gh-repo-list"></datalist>
+      </label>
+      <label class="field">
+        <span>分支</span>
+        <input id="gh-branch-input" type="text" placeholder="main" autocomplete="off" />
+      </label>
+      <label class="field">
+        <span>文档路径</span>
+        <input id="gh-path-input" type="text" placeholder="bookmarks.json" autocomplete="off" />
+      </label>
+    </div>
+    <div class="row gap">
+      <button id="btn-gh-connect" class="primary">连接仓库</button>
+      <button id="btn-gh-repos" class="ghost small">列出我的仓库</button>
+      <button id="btn-gh-disconnect" class="ghost small">断开</button>
+    </div>
+    <p class="hint">
+      在 GitHub → Settings → Developer settings → <b>Personal access tokens → Fine-grained tokens</b> 创建：
+      选好仓库后把 <b>Repository permissions → Contents</b> 设为 <b>Read and write</b>，其余留空即可。
+      Token 只存本机，不经过任何第三方。
+    </p>
+  </section>
+
+  <section class="card" id="card-drive">
+    <h2>2. Google Drive 账号</h2>
     <div class="kv"><span>当前账号</span><b id="auth-account">未连接</b></div>
     <div class="kv"><span>授权状态</span><b id="auth-state">—</b></div>
     <div class="kv wrap"><span>重定向 URI</span><code id="redirect-uri" class="copyable">—</code></div>
@@ -65,7 +124,7 @@
   </section>
 
   <section class="card">
-    <h2>2. 同步行为</h2>
+    <h2>3. 同步行为</h2>
     <div class="grid2">
       <label class="field">
         <span>自动同步</span>
@@ -106,7 +165,7 @@
   </section>
 
   <section class="card">
-    <h2>3. 冲突与删除保护</h2>
+    <h2>4. 冲突与删除保护</h2>
     <div class="grid2">
       <label class="field">
         <span>字段冲突（标题 / URL / 位置）</span>
@@ -143,7 +202,7 @@
   </div>
 
   <section class="card">
-    <h2>4. 历史快照与恢复</h2>
+    <h2>5. 历史快照与恢复</h2>
     <div class="row gap">
       <button id="btn-snapshot" class="ghost">立即创建快照</button>
       <button id="btn-refresh-snapshots" class="ghost small">刷新列表</button>
@@ -157,7 +216,7 @@
   </section>
 
   <section class="card">
-    <h2>5. 环境自检</h2>
+    <h2>6. 环境自检</h2>
     <p class="hint">在 ego(lite) 这类 Chromium 分支上，扩展 API 的支持程度可能不同。部署前跑一次，能立刻看出是哪一项不满足。</p>
     <div class="row gap">
       <button id="btn-selftest" class="ghost">运行自检</button>
@@ -167,7 +226,7 @@
   </section>
 
   <section class="card">
-    <h2>6. 运行日志</h2>
+    <h2>7. 运行日志</h2>
     <div class="row gap">
       <button id="btn-refresh-logs" class="ghost small">刷新</button>
       <button id="btn-clear-logs" class="ghost small">清空</button>

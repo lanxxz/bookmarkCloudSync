@@ -1,10 +1,11 @@
 # Bookmark Cloud Sync
 
-把 **Chrome** 与 **ego(lite)** 的书签双向同步到 **Google Drive 的 appDataFolder**（扩展私有空间，不混入普通网盘文件）。
+把 **Chrome** 与 **ego(lite)** 的书签双向同步到你的私有云端：**GitHub 私有仓库** 或 **Google Drive appDataFolder**，二选一。
 
 - 不修改任何浏览器本体，纯扩展实现（Manifest V3 + 原生 JavaScript，零构建、零依赖）。
 - 删除**先快照、后执行**：每次同步前落一份本地 + 云端快照，误删可一键回滚。
 - **三方合并**（base / local / remote）而不是"覆盖"，两台设备同时改也不丢数据。
+- 存储层可插拔：合并逻辑完全不感知底层是 Drive 还是 GitHub。
 
 ~~~
 
@@ -12,15 +13,27 @@ Chrome 扩展 A ──┐                        ┌── ego(lite) 扩展 B
  base/local/remote                      base/local/remote
         │                               │
         ▼                               ▼
-   ┌──────────────────────────────────────────┐
-   │  Google Drive appDataFolder              │
-   │   bookmarks.json     全量节点 + 墓碑      │
-   │   bcs-history/       历史快照（环形保留）  │
-   └──────────────────────────────────────────┘
+   ┌────────────────────────────────────────────┐
+   │  storage/index.js  ← 后端路由（同一套接口）  │
+   ├────────────────────────────────────────────┤
+   │  GitHub 私有仓库        │  Drive appDataFolder│
+   │   bookmarks.json        │   bookmarks.json   │
+   │   bcs-history/snap-*    │   bcs-history/     │
+   │   每次同步 = 一个 commit │   每次同步 = 一次上传│
+   └────────────────────────────────────────────┘
 
 ~~~
 
 ---
+
+## 零、两种云端可选
+
+| 后端 | 前置条件 | 适用场景 |
+| --- | --- | --- |
+| **GitHub 私有仓库**（推荐） | 一个仓库 + 一个 fine-grained PAT | 不需要 GCP 项目；不需要 `chrome.identity`，ego(lite) 直接可用；每次同步一个 commit，天然可回滚 |
+| **Google Drive appDataFolder** | GCP 项目 + OAuth 客户端 | 已熟悉 Google 生态；数据留在网盘私有隐藏目录 |
+
+设置页顶部切换，两者互不影响。详见 [docs/GITHUB-BACKEND.md](docs/GITHUB-BACKEND.md)。
 
 ## 一、它解决什么问题
 
@@ -114,6 +127,11 @@ bookmarkCloudSync/
 │   │   ├── protocol.js        文档 schema + 三方合并 + 树修复 + 应用计划（纯函数，可测）
 │   │   ├── local.js           chrome.bookmarks 适配层（扫描 / 落地 / 清空）
 │   │   ├── drive.js           Drive v3 客户端（appDataFolder / ETag / 重试）
+│   │   ├── storage/           存储后端抽象
+│   │   │   ├── base.js        StorageError / UTF-8 base64 / 路径清洗 / 退避重试
+│   │   │   ├── github.js      GitHub Contents API（sha 乐观锁 / raw 大文件）
+│   │   │   ├── drive.js       Drive 适配器（把 drive.js 包成同一接口）
+│   │   │   └── index.js       后端路由 + 凭证解析
 │   │   ├── auth.js            OAuth 2.0（PKCE / 隐式 / 手动 token）
 │   │   ├── history.js         本地 + 云端快照
 │   │   ├── sync.js            同步编排（加锁 / 引导 / 重试 / 差异保护 / 恢复）
@@ -129,7 +147,7 @@ bookmarkCloudSync/
 │   └── ui/
 │       ├── popup.html/js/css  状态、立即同步、预览、待确认
 │       └── options.html/js/css 授权、参数、冲突策略、快照、自检、日志
-├── tests/                     49 个单元/仿真测试（node:test）
+├── tests/                     70 个单元/仿真测试（node:test）
 ├── tools/                     图标、扩展 key、校验、打包脚本
 └── docs/                      协议说明、部署、排错
 ~~~
@@ -200,7 +218,7 @@ bookmarkCloudSync/
 ## 六、开发与验证
 
 ~~~bash
-npm run test     # 49 个测试：合并语义、树修复、墓碑、删除保护、双设备收敛仿真
+npm run test     # 70 个测试：合并语义、树修复、墓碑、删除保护、双设备收敛仿真、GitHub 后端契约
 npm run check    # manifest 校验 + 全部模块装载 + 未使用导入
 npm run icons    # 重新生成图标
 npm run key      # 重新生成扩展公钥（会改变扩展 ID）
@@ -226,7 +244,7 @@ npm run pack     # 打包 dist/bookmark-cloud-sync-vX.Y.Z.zip
 | identity | launchWebAuthFlow 走 OAuth |
 | notifications | 同步完成提示（可关闭） |
 | contextMenus | 右键图标"立即同步" |
-| host_permissions | 仅 www.googleapis.com 与 oauth2.googleapis.com |
+| host_permissions | 仅 www.googleapis.com / oauth2.googleapis.com / api.github.com |
 
 - 作用域只要 https://www.googleapis.com/auth/drive.appdata ：**只能读写本扩展自己的隐藏目录**，看不到网盘里的其它文件。
 - Token 存在本机 chrome.storage.local，不上传任何第三方；随时可在设置页"断开"（会调用 Google revoke）。
@@ -236,7 +254,7 @@ npm run pack     # 打包 dist/bookmark-cloud-sync-vX.Y.Z.zip
 
 ## 八、已知边界
 
-- **ego(lite) 的 chrome.identity**：如果该分支不提供 launchWebAuthFlow，自检会标"注意"。此时改用**手动 token 模式**（从 Google OAuth Playground 取一个带 drive.appdata 的 access token 粘贴）。token 1 小时过期，适合临时验证。
+- **ego(lite) 的 chrome.identity**：如果该分支不提供 launchWebAuthFlow，自检会标"注意"。两条出路：改用 **GitHub 后端**（完全不需要 identity API，推荐），或用 Drive 的**手动 token 模式**（1 小时过期，仅适合临时验证）。
 - **书签顺序**：合并时顺序按 (index, id) 决定；两端同时插入不同位置时可能略有差异，但不影响内容。
 - **超大书签树**（> 2 万条）：全量文档约 1–3 MB，仍在 Drive 单次 multipart 上传范围内；但首轮扫描会比较慢，建议先手动同步一次。
 - **扩展 ID 与重定向 URI 绑定**：改 manifest.key 必须同步改 Google 控制台里的重定向 URI。

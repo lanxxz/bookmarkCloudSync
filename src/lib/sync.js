@@ -36,8 +36,8 @@ import {
   buildBaseAfterPending
 } from './protocol.js';
 import { scanLocal, applyLocalPlan, refreshMapping, resolveRootParent, clearRootParentCache } from './local.js';
-import { readJsonFile, createTextFile, updateTextFile } from './drive.js';
-import { getSettings, requireToken, peekToken } from './auth.js';
+import { backendFor, isConflict, resolveToken } from './storage/index.js';
+import { getSettings } from './auth.js';
 import { getIdbState, setIdbState, pruneLocalSnapshots } from './idb.js';
 import { saveLocalSnapshot, saveRemoteSnapshot, SNAPSHOT_KIND } from './history.js';
 import { hashString, now as nowFn, randomId } from './util.js';
@@ -195,17 +195,43 @@ export function rebuildSeen(index) {
  * 远端读取
  * ------------------------------------------------------------------ */
 
+/**
+ * 读取云端文档。
+ *
+ * 存储后端由设置决定（Google Drive 或 GitHub 私有仓库），这里只跟抽象接口打交道：
+ * 返回的 version 对 Drive 是 ETag、对 GitHub 是 blob sha，语义都是"写回去时的乐观锁"。
+ */
 export async function readRemote({ token, settings } = {}) {
   const s = settings || (await getSettings());
-  const name = s.driveFile || 'bookmarks.json';
-  const file = await readJsonFile(name, { token });
-  if (!file) return { exists: false, doc: null, fileId: '', etag: '', name };
-  const parsed = docFromJson(file.text);
+  const { name: backendName, backend } = backendFor(s);
+  const cfg = backend.cfgFromSettings(s);
+  const res = await backend.readDoc(cfg, { token });
+
+  if (!res.exists) {
+    return { exists: false, doc: null, fileId: '', etag: '', name: cfg.path, backend: backendName };
+  }
+  const parsed = docFromJson(res.text);
   if (!parsed.ok) {
     logger.error('云端文档解析失败', parsed);
     throw Object.assign(new Error('云端文档格式异常：' + (parsed.error || 'unknown')), { code: 'REMOTE_CORRUPT' });
   }
-  return { exists: true, doc: parsed.doc, fileId: file.meta.id, etag: file.etag || '', name, raw: file.text };
+  return {
+    exists: true,
+    doc: parsed.doc,
+    fileId: res.fileId || '',
+    etag: res.version || '',
+    name: cfg.path,
+    backend: backendName,
+    raw: res.text
+  };
+}
+
+/** 云端连接是否就绪（GitHub 需要 PAT + 仓库配置） */
+export async function ensureRemoteReady(settings) {
+  const s = settings || (await getSettings());
+  const { name: backendName, backend } = backendFor(s);
+  const cfg = backend.cfgFromSettings(s);
+  return { backend: backendName, cfg };
 }
 
 /** 把用户设置翻译成合并策略（含墓碑保留期） */
@@ -259,7 +285,7 @@ export function countActive(index) {
 
 export async function previewSync({ token, settings } = {}) {
   const s = settings || (await getSettings());
-  const auth = token || (await requireToken());
+  const auth = token || (await resolveToken(s));
   const state = (await loadState()) || { ...defaultState(await ensureDeviceId()), baseIndex: new Map(), mapping: new Map() };
 
   const local = await scanLocal({ mapping: state.mapping, deviceId: state.deviceId });
@@ -313,8 +339,10 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
   const startedAt = Date.now();
   try {
     const s = settings || (await getSettings());
-    const auth = token || (await requireToken());
     const deviceId = await ensureDeviceId();
+    const { backend } = backendFor(s);
+    const auth = token || (await resolveToken(s));
+    const cfg = backend.cfgFromSettings(s);
     const state = (await loadState()) || { ...defaultState(deviceId), baseIndex: new Map(), mapping: new Map() };
     clearRootParentCache();
 
@@ -332,12 +360,23 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
       logger.info('云端暂无同步文档，使用本机书签初始化');
       const doc = createDoc({ nodes: localIndex, revision: 1, writer: deviceId });
       await saveLocalSnapshot({ index: localIndex, kind: SNAPSHOT_KIND.PRE_PUSH, deviceId, reason: '初始化上传' });
-      const created = await createTextFile(remote.name, serializeDoc(doc), { token: auth });
-      await saveRemoteSnapshot({ index: localIndex, kind: SNAPSHOT_KIND.PRE_PUSH, deviceId, reason: '初始化上传', revision: 1, token: auth });
+      const created = await backend.writeDoc(cfg, serializeDoc(doc), {
+        token: auth,
+        message: 'chore(bcs): initial bookmarks sync (r1)'
+      });
+      await saveRemoteSnapshot({
+        index: localIndex,
+        kind: SNAPSHOT_KIND.PRE_PUSH,
+        deviceId,
+        reason: '初始化上传',
+        revision: 1,
+        token: auth,
+        settings: s
+      });
       const next = {
         ...state,
         deviceId,
-        fileId: created.id,
+        fileId: created.fileId || '',
         etag: '',
         revision: 1,
         lastSyncAt: Date.now(),
@@ -401,9 +440,13 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
       await saveLocalSnapshot({ index: remoteIndex, kind: SNAPSHOT_KIND.PRE_PUSH, deviceId, reason: '推送云端前' });
 
       try {
-        const res = await updateTextFile(remote.fileId, body, { token: auth, etag: remote.etag, name: remote.name });
-        uploaded = { revision: nextRevision, fileId: res.id || remote.fileId, diff: cloudDiff };
-        state.fileId = res.id || remote.fileId;
+        const res = await backend.writeDoc(cfg, body, {
+          token: auth,
+          version: remote.etag,
+          message: 'chore(bcs): sync bookmarks r' + nextRevision + ' (' + deviceId.slice(0, 10) + ')'
+        });
+        uploaded = { revision: nextRevision, fileId: res.fileId || remote.fileId, diff: cloudDiff, version: res.version || '' };
+        state.fileId = res.fileId || remote.fileId;
         logger.success('已推送云端 r' + nextRevision + '（+' + cloudDiff.created + ' ~' + cloudDiff.updated + ' -' + cloudDiff.deleted + '）');
         await saveRemoteSnapshot({
           index: mergedIndex,
@@ -415,8 +458,8 @@ export async function sync({ reason = 'manual', token, settings } = {}) {
         });
         break;
       } catch (err) {
-        if (err.code === 'PRECONDITION_FAILED' && attempt < MAX_CLOUD_RETRY) {
-          logger.warn('云端已被其它设备更新（412），重新读取并合并（第 ' + attempt + ' 次）');
+        if (isConflict(err) && attempt < MAX_CLOUD_RETRY) {
+          logger.warn('云端已被其它设备更新（' + (err.code || err.status) + '），重新读取并合并（第 ' + attempt + ' 次）');
           remote = await readRemote({ token: auth, settings: s });
           if (!remote.exists) throw new Error('云端文档在合并过程中被删除');
           continue;
@@ -616,24 +659,38 @@ export function hashTree(index) {
 export async function getStatus() {
   const state = await loadState();
   const s = await getSettings();
-  const token = await peekToken();
+  const { backendStatus, peekTokenFor } = await import('./storage/index.js');
+  const backend = await backendStatus(s);
+  const token = await peekTokenFor(s);
+  const connected = !!(backend.configured && token);
+
   if (!state) {
     return {
       initialized: false,
-      configured: !!s.clientId || s.authMode === 'manual',
+      backend: backend.backend,
+      backendLabel: backend.label,
+      target: backend.target,
+      configured: backend.configured,
       authorized: !!token,
-      account: s.account,
+      connected,
+      account: backend.account || s.account,
       settings: s,
       deviceId: '',
       lastSyncAt: 0,
-      pending: null
+      pending: null,
+      conflicts: [],
+      stats: null
     };
   }
   return {
     initialized: true,
-    configured: !!s.clientId || s.authMode === 'manual',
+    backend: backend.backend,
+    backendLabel: backend.label,
+    target: backend.target,
+    configured: backend.configured,
     authorized: !!token,
-    account: s.account,
+    connected,
+    account: backend.account || s.account,
     deviceId: state.deviceId,
     fileId: state.fileId,
     revision: state.revision,
@@ -665,7 +722,7 @@ export async function restoreSnapshot({ source = 'local', id, token, mode = 'rep
   const { clearLocalBookmarks } = await import('./local.js');
   const s = await getSettings();
   const deviceId = await ensureDeviceId();
-  const auth = token || (await requireToken());
+  const auth = token || (await resolveToken(s));
 
   const snap = await loadSnapshotNodes({ id, source, token: auth });
   const targetIndex = normalizeIndices(snap.nodes);

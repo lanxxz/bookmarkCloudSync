@@ -36,6 +36,10 @@ must(
   manifest.host_permissions.some((h) => h.includes('oauth2.googleapis.com')),
   'host_permissions 缺少 oauth2.googleapis.com'
 );
+must(
+  manifest.host_permissions.some((h) => h.includes('api.github.com')),
+  'host_permissions 缺少 api.github.com（GitHub 后端需要）'
+);
 
 must(manifest.background && manifest.background.type === 'module', 'background 必须是 type: module');
 must(manifest.background.service_worker, '缺少 background.service_worker');

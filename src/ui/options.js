@@ -45,6 +45,14 @@ const FIELDS = [
 ];
 
 function applySettings(s) {
+  const backend = s.backend === 'github' ? 'github' : 'drive';
+  const radio = $(backend === 'github' ? 'backend-github' : 'backend-drive');
+  if (radio) radio.checked = true;
+  applyBackendVisibility(backend);
+  $('gh-token').value = '';
+  $('gh-repo').value = s.githubOwner && s.githubRepo ? s.githubOwner + '/' + s.githubRepo : '';
+  $('gh-branch-input').value = s.githubBranch || 'main';
+  $('gh-path-input').value = s.githubPath || 'bookmarks.json';
   $('client-id').value = s.clientId || '';
   $('client-secret').value = s.clientSecret || '';
   $('auth-mode').value = s.authMode || 'pkce';
@@ -65,6 +73,12 @@ function applySettings(s) {
 
 function collectSettings() {
   const patch = {};
+  patch.backend = currentBackend();
+  const slug = parseRepoSlug($('gh-repo').value);
+  patch.githubOwner = slug ? slug.owner : '';
+  patch.githubRepo = slug ? slug.repo : '';
+  patch.githubBranch = $('gh-branch-input').value.trim() || 'main';
+  patch.githubPath = $('gh-path-input').value.trim() || 'bookmarks.json';
   patch.clientId = $('client-id').value.trim();
   patch.clientSecret = $('client-secret').value.trim();
   patch.authMode = $('auth-mode').value;
@@ -97,9 +111,129 @@ function toggleManualRow() {
   $('manual-token-row').style.display = $('auth-mode').value === 'manual' ? 'flex' : 'none';
 }
 
+/* ---------------- 后端切换 ---------------- */
+
+function currentBackend() {
+  const checked = document.querySelector('input[name="backend"]:checked');
+  return checked && checked.value === 'github' ? 'github' : 'drive';
+}
+
+function applyBackendVisibility(backend) {
+  $('card-github').classList.toggle('hidden', backend !== 'github');
+  $('card-drive').classList.toggle('hidden', backend !== 'drive');
+  for (const opt of document.querySelectorAll('.backend-option')) {
+    opt.classList.toggle('selected', opt.dataset.backend === backend);
+  }
+  $('welcome').classList.toggle('hidden', backend !== 'drive' || !new URLSearchParams(location.search).get('welcome'));
+}
+
+async function switchBackend(backend) {
+  applyBackendVisibility(backend);
+  try {
+    const status = await send(MSG.BACKEND_SET, { backend });
+    toast('已切换到 ' + status.label);
+    await refreshAuth();
+    await loadSnapshots();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+/* ---------------- GitHub ---------------- */
+
+function parseRepoSlug(raw) {
+  const v = String(raw || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '');
+  const parts = v.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  return { owner: parts[0], repo: parts[1] };
+}
+
+async function refreshGithubStatus() {
+  try {
+    const res = await send(MSG.GITHUB_STATUS);
+    const status = res.status || {};
+    if (status.backend !== 'github') {
+      $('gh-state').textContent = '当前未使用 GitHub 后端';
+      $('gh-target').textContent = status.target || '—';
+      $('gh-branch').textContent = '—';
+      return;
+    }
+    $('gh-state').textContent = status.authorized
+      ? '已连接' + (status.account ? '（' + status.account + '）' : '')
+      : status.configured
+        ? '已填写仓库，但还没有有效 Token'
+        : '未配置';
+    $('gh-target').textContent = status.target || '—';
+    $('gh-branch').textContent = (status.branch || 'main') + ' / ' + ($('gh-path-input').value || 'bookmarks.json');
+    if (!status.configured && !$('gh-repo').value) $('btn-gh-connect').classList.add('primary');
+  } catch (err) {
+    $('gh-state').textContent = '读取失败：' + err.message;
+  }
+}
+
+async function connectGithubFromForm() {
+  const token = $('gh-token').value.trim();
+  const slug = parseRepoSlug($('gh-repo').value);
+  if (!token) return toast('请先填写 Fine-grained PAT', 'warn');
+  if (!slug) return toast('仓库格式应为 owner/repo', 'warn');
+  $('btn-gh-connect').disabled = true;
+  try {
+    const res = await send(MSG.GITHUB_CONNECT, {
+      token,
+      owner: slug.owner,
+      repo: slug.repo,
+      branch: $('gh-branch-input').value.trim() || 'main',
+      path: $('gh-path-input').value.trim() || 'bookmarks.json'
+    });
+    $('gh-token').value = '';
+    if (res.repoInfo && res.repoInfo.private === false) {
+      toast('已连接，但该仓库是公开的 —— 建议改成 Private，否则书签内容对所有人可见', 'warn');
+    } else {
+      toast('已连接 ' + slug.owner + '/' + slug.repo);
+    }
+    await refreshGithubStatus();
+    await refreshAuth();
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    $('btn-gh-connect').disabled = false;
+  }
+}
+
+async function listGithubRepos() {
+  const token = $('gh-token').value.trim();
+  if (token) {
+    // 先把 token 存下来才能列仓库
+    const slug = parseRepoSlug($('gh-repo').value) || { owner: '', repo: '' };
+    if (!slug.owner) {
+      toast('请先填写完整仓库名再点「连接仓库」，或用下面的方式直接输入', 'warn');
+    }
+  }
+  try {
+    const repos = await send(MSG.GITHUB_REPOS, { limit: 50 });
+    const dl = $('gh-repo-list');
+    dl.textContent = '';
+    for (const r of repos) {
+      const opt = document.createElement('option');
+      opt.value = r.fullName;
+      opt.label = (r.private ? '🔒 ' : '🌐 ') + r.fullName + (r.canPush ? '' : '（无写权限）');
+      dl.appendChild(opt);
+    }
+    toast('已加载 ' + repos.length + ' 个仓库，点击输入框可选');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
 /* ---------------- 授权 ---------------- */
 
 async function refreshAuth() {
+  const backend = currentBackend();
+  if (backend === 'github') {
+    $('auth-account').textContent = $('gh-state').textContent;
+    $('auth-state').textContent = 'GitHub 后端（不需要 Google 授权）';
+    return;
+  }
   try {
     const state = await send(MSG.AUTH_STATE);
     $('auth-account').textContent = state.account || '未连接';
@@ -323,6 +457,23 @@ $('btn-snapshot').addEventListener('click', async () => {
   await loadSnapshots();
 });
 
+for (const opt of document.querySelectorAll('input[name="backend"]')) {
+  opt.addEventListener('change', () => switchBackend(currentBackend()));
+}
+
+$('btn-gh-connect').addEventListener('click', connectGithubFromForm);
+$('btn-gh-repos').addEventListener('click', listGithubRepos);
+$('btn-gh-disconnect').addEventListener('click', async () => {
+  if (!confirm('断开后 Token 会从本机删除，云端数据不受影响。继续？')) return;
+  try {
+    await send(MSG.GITHUB_DISCONNECT);
+    toast('已断开 GitHub 连接');
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+  await refreshGithubStatus();
+});
+
 $('btn-selftest').addEventListener('click', async () => {
   const list = $('selftest-list');
   list.textContent = '检测中…';
@@ -390,6 +541,7 @@ for (const tab of document.querySelectorAll('.tab')) {
   const settings = await send(MSG.GET_SETTINGS).catch(() => null);
   if (settings) applySettings(settings);
   await refreshAuth();
+  await refreshGithubStatus();
   await loadLogs();
   await loadSnapshots();
 

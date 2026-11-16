@@ -48,7 +48,10 @@ async function refresh() {
 function renderStatus(s) {
   const dot = $('status-dot');
   dot.className = 'dot';
-  $('account-line').textContent = s.authorized ? '已连接：' + (s.account || '未知账号') : '未连接 Google 账号';
+  const backendName = s.backendLabel || '云端';
+  $('account-line').textContent = s.connected
+    ? backendName + '：' + (s.target || s.account || '已连接')
+    : backendName + '：未连接' + (s.account ? '（' + s.account + '）' : '');
   $('last-sync').textContent = s.lastSyncAt ? formatRelative(s.lastSyncAt) : '从未';
   $('revision').textContent = s.revision ? 'r' + s.revision : '—';
   $('device-id').textContent = s.deviceId ? s.deviceId.replace(/^dev-/, '').slice(0, 10) : '—';
@@ -56,10 +59,10 @@ function renderStatus(s) {
 
   if (!s.configured) {
     dot.classList.add('warn');
-    $('status-text').textContent = '需要先填写 OAuth Client ID';
-  } else if (!s.authorized) {
+    $('status-text').textContent = s.backend === 'github' ? '需要先填写 GitHub 仓库' : '需要先填写 OAuth Client ID';
+  } else if (!s.connected) {
     dot.classList.add('warn');
-    $('status-text').textContent = '未授权，请连接 Google 账号';
+    $('status-text').textContent = s.backend === 'github' ? '未填写 GitHub Token' : '未授权，请连接 Google 账号';
   } else if (s.pending) {
     dot.classList.add('warn');
     $('status-text').textContent = '等待确认删除操作';

@@ -14,8 +14,7 @@ import {
   authorize,
   signOut,
   getAuthState,
-  setManualToken,
-  peekToken
+  setManualToken
 } from '../lib/auth.js';
 import {
   sync,
@@ -32,9 +31,11 @@ import {
 import { getLocalSnapshots, listRemoteSnapshots, saveLocalSnapshot, SNAPSHOT_KIND } from '../lib/history.js';
 import { scanLocal } from '../lib/local.js';
 import { installWatch, requestAutoSync, bindSyncRunner } from './bookmark-watch.js';
-import { setupAlarms, ALARM_SYNC, ALARM_REMOTE, checkRemoteChanged } from './alarms.js';
+import { setupAlarms, ALARM_SYNC, ALARM_REMOTE, checkRemoteChanged, markRemoteSeen } from './alarms.js';
 import { createDoc, serializeDoc, docStats, docFromJson } from '../lib/protocol.js';
 import { runSelfTest } from '../lib/selftest.js';
+import { backendStatus, BACKENDS, resolveBackend, peekTokenFor } from '../lib/storage/index.js';
+import { connectGithub, readGithubAuth, writeGithubAuth, listRepos } from '../lib/storage/github.js';
 
 const CONTEXT_MENU_ID = 'bcs-sync-now';
 
@@ -101,6 +102,54 @@ async function handleMessage(msg) {
     case MSG.SELF_TEST:
       return runSelfTest();
 
+    case MSG.BACKEND_STATUS: {
+      const settings = await getSettings();
+      return backendStatus(settings);
+    }
+
+    case MSG.BACKEND_SET: {
+      const backend = msg.backend === BACKENDS.GITHUB ? BACKENDS.GITHUB : BACKENDS.DRIVE;
+      const next = await saveSettings({ backend });
+      const status = await backendStatus(next);
+      logger.info('存储后端切换为 ' + status.label);
+      return status;
+    }
+
+    case MSG.GITHUB_CONNECT: {
+      const settings = await getSettings();
+      const owner = String(msg.owner || settings.githubOwner || '').trim();
+      const repo = String(msg.repo || settings.githubRepo || '').trim();
+      const res = await connectGithub({ token: msg.token, owner, repo });
+      await saveSettings({
+        backend: BACKENDS.GITHUB,
+        githubOwner: owner,
+        githubRepo: repo,
+        githubBranch: msg.branch || settings.githubBranch || (res.repoInfo && res.repoInfo.defaultBranch) || 'main',
+        githubPath: msg.path || settings.githubPath || 'bookmarks.json',
+        account: res.login
+      });
+      logger.success('已连接 GitHub 仓库 ' + owner + '/' + repo + '（' + res.login + '）');
+      return { ...res, status: await backendStatus(await getSettings()) };
+    }
+
+    case MSG.GITHUB_DISCONNECT:
+      await writeGithubAuth(null);
+      await saveSettings({ githubOwner: '', githubRepo: '', account: '' });
+      logger.info('已断开 GitHub 连接');
+      return { ok: true };
+
+    case MSG.GITHUB_STATUS: {
+      const settings = await getSettings();
+      const auth = await readGithubAuth();
+      return { auth: auth ? { login: auth.login, owner: auth.owner, repo: auth.repo, addedAt: auth.addedAt } : null, status: await backendStatus(settings) };
+    }
+
+    case MSG.GITHUB_REPOS: {
+      const auth = await readGithubAuth();
+      if (!auth || !auth.token) throw new Error('请先填写并验证 GitHub Token');
+      return listRepos({ token: auth.token, limit: msg.limit || 50 });
+    }
+
     case MSG.GET_SETTINGS:
       return getSettings();
 
@@ -142,10 +191,11 @@ async function handleMessage(msg) {
 
     case MSG.LIST_SNAPSHOTS: {
       const local = await getLocalSnapshots(60);
+      const settings = await getSettings();
       let remote = [];
       try {
-        const token = await peekToken();
-        if (token) remote = await listRemoteSnapshots({ token });
+        const token = await peekTokenFor(settings);
+        if (token) remote = await listRemoteSnapshots({ token, settings });
       } catch (err) {
         logger.warn('读取云端快照列表失败', err);
       }
@@ -225,8 +275,15 @@ let lastRun = 0;
 async function runSync(reason) {
   if (isLocked()) return { ok: false, skipped: true, message: '同步正在进行中' };
   const settings = await getSettings();
-  const token = await peekToken();
-  if (!token) return { ok: false, error: 'AUTH_REQUIRED', message: '请先在设置里连接 Google 账号' };
+  const backend = resolveBackend(settings);
+  const token = await peekTokenFor(settings);
+  if (!token) {
+    return {
+      ok: false,
+      error: 'AUTH_REQUIRED',
+      message: backend === BACKENDS.GITHUB ? '请先在设置里填写 GitHub Token' : '请先在设置里连接 Google 账号'
+    };
+  }
 
   const gap = Date.now() - lastRun;
   const isAuto = reason === 'auto' || reason === 'alarm' || reason === 'remote-change' || reason === 'deferred';
@@ -237,6 +294,8 @@ async function runSync(reason) {
 
   const result = await sync({ reason, token, settings });
   await updateBadge(result);
+  // 自己写完立刻记下远端版本，避免下一轮轮询把"我刚推的"当成别人的改动
+  if (result.ok) await markRemoteSeen({ settings }).catch(() => {});
   if (result.ok && result.toLocal && (result.toLocal.created || result.toLocal.deleted)) {
     notify('书签已同步：新增 ' + result.toLocal.created + '，删除 ' + result.toLocal.deleted);
   }

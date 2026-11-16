@@ -207,7 +207,10 @@ async function parseUpload(res, action, name) {
       retryable: res.status === 429 || res.status >= 500
     });
   }
-  return res.json();
+  const meta = await res.json();
+  // 把 ETag 挂在返回值上，供下一次写入做 If-Match
+  meta.__etag = res.headers.get('ETag') || '';
+  return meta;
 }
 
 /** 在 appDataFolder 里建子目录（multipart 传空 body 建文件夹会 400，所以单独走元数据接口） */
