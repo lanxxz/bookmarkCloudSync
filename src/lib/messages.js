@@ -1,0 +1,26 @@
+/** UI <-> service worker 的消息协议，集中定义避免拼写漂移。 */
+export const MSG = Object.freeze({
+  PING: 'ping',
+  GET_STATUS: 'get-status',
+  SYNC_NOW: 'sync-now',
+  PREVIEW: 'preview',            // 只计算差异，不写任何东西
+  APPLY_PREVIEW: 'apply-preview', // 用户确认后执行待处理计划
+  CANCEL_PENDING: 'cancel-pending',
+  GET_LOGS: 'get-logs',
+  CLEAR_LOGS: 'clear-logs',
+  GET_SETTINGS: 'get-settings',
+  SAVE_SETTINGS: 'save-settings',
+  AUTH_START: 'auth-start',
+  AUTH_SIGNOUT: 'auth-signout',
+  AUTH_STATE: 'auth-state',
+  SET_MANUAL_TOKEN: 'set-manual-token',
+  LIST_SNAPSHOTS: 'list-snapshots',
+  CREATE_SNAPSHOT: 'create-snapshot',
+  RESTORE_SNAPSHOT: 'restore-snapshot',
+  EXPORT_DOC: 'export-doc',
+  IMPORT_DOC: 'import-doc',
+  RESET_SYNC: 'reset-sync',
+  OPEN_OPTIONS: 'open-options',
+  DEVICE_INFO: 'device-info',
+  SELF_TEST: 'self-test'
+});

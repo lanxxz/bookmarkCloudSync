@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Bookmark Cloud Sync",
+  "short_name": "BCS",
+  "version": "1.0.0",
+  "description": "把 Chrome / ego(lite) 书签双向同步到 Google Drive 私有 appDataFolder：删除前自动快照，冲突合并，一键恢复。",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "bookmarks",
+    "storage",
+    "unlimitedStorage",
+    "alarms",
+    "identity",
+    "notifications",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://oauth2.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Bookmark Cloud Sync",
+    "default_popup": "src/ui/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "src/ui/options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuom9QNbkjxm1HcZE7C0Zj2ndLwY6mNy9zIgLtiVWBy1OSVTSDU+Cya8cMmcmOVmUzXirbKlhvtBBWceqySXmT9B7Pvc2quZa3XPSKLOvAIHKKFakchtwZFXlXXW4UUhnfzlplwZqK4Zs3B4jDf1VPIrOUesLY/EDFk9pcnsYPKmyjwHuB6M45cbO1UtEtjsdDJp3fBAojEv63DCc6DkV/BpcL3/36/WMey+4l2JwYxtYFUoZI090cSla/9sadm0auONP8kg2YT32dgVv5q1OnB6h5Rb7NUv6lwnbq2v5joTzatav1s6sznUBNk+BOsroVLGnCQLHtUgg44KdPNiXswIDAQAB"
+}
