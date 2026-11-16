@@ -127,7 +127,10 @@ test('云端当前版本是空壳时，自动回溯到历史 commit 并返回可
     assert.equal(r.exists, true);
     assert.ok(r.recoveredFrom, '应标记为已从历史恢复');
     assert.equal(r.recoveredFrom.sha, 'c2', '应跳过内容也坏掉的 c3');
-    assert.equal(r.etag, 'blob-c2', '乐观锁必须用恢复版本的 sha');
+    /* 乐观锁必须用【当前 HEAD】的 sha（head123），不是历史版本的 blob sha。
+     * 用历史 blob sha 写当前文件，GitHub 会一直回 409 does not match。 */
+    assert.equal(r.etag, 'head123', '乐观锁必须是当前 HEAD 的 sha');
+    assert.equal(r.recoveredFrom.overwritesHead, 'head123');
     const titles = [...r.doc.nodes.values()].map((n) => n.title);
     assert.deepEqual(titles, ['历史版本里的书签']);
   });

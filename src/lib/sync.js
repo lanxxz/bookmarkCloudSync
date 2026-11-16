@@ -270,13 +270,17 @@ export async function readRemote({ token, settings } = {}) {
     exists: true,
     doc: parsed.doc,
     fileId: res.fileId || '',
-    /* 用了历史版本时，乐观锁必须用那个版本的 sha，否则写回必然 409 */
-    etag: recovered ? recovered.blobSha || res.version || '' : res.version || '',
+    /* 乐观锁永远用【当前 HEAD】的 sha。
+     * 历史版本只提供"内容"，不能用它的 blob sha 去覆盖当前文件 ——
+     * 那个 sha 属于另一个 commit，GitHub 会一直回 409 does not match。
+     * 这条曾经写错，导致"回溯恢复后写入必失败"。 */
+    etag: res.version || '',
     name: cfg.path,
     backend: backendName,
     raw: recovered ? recovered.text : res.text,
     repaired: parsed.repaired || '',
-    recoveredFrom: recovered ? { sha: recovered.sha, blobSha: recovered.blobSha, message: recovered.message } : null
+    /* 记录从哪里捞回的内容，便于日志定位；注意它不代表可写版本 */
+    recoveredFrom: recovered ? { sha: recovered.sha, message: recovered.message, overwritesHead: res.version || '' } : null
   };
 }
 

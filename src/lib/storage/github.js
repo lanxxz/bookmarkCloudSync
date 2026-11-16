@@ -220,25 +220,49 @@ export async function headFile(cfg, path, { token } = {}) {
 
 export async function writeFile(cfg, path, text, { token, version, message } = {}) {
   const api = fileApiPath(cfg, path);
-  const body = {
-    message: message || 'chore(bcs): sync bookmarks ' + new Date().toISOString(),
-    content: toBase64Utf8(text),
-    branch: cfg.branch
+  const makeBody = (sha) => {
+    const body = {
+      message: message || 'chore(bcs): sync bookmarks ' + new Date().toISOString(),
+      content: toBase64Utf8(text),
+      branch: cfg.branch
+    };
+    if (sha) body.sha = sha;
+    return body;
   };
-  if (version) body.sha = version;
 
-  return retrying(
-    async () => {
-      const res = await ghFetch(api, { token, method: 'PUT', body });
-      const contentSha = (res.content && res.content.sha) || '';
-      return {
-        version: contentSha,
-        commit: (res.commit && res.commit.sha) || '',
-        changed: true
-      };
-    },
-    { retries: 2 }
-  );
+  /*
+   * 兜底通道：调用方没给 sha（或给的已被云端刷新）时，GitHub 对已存在的文件
+   * 会返回 422 "sha wasn't supplied"。这类错误不该冒泡成"并发冲突"，
+   * 而是说明我们手上的版本号过期了 —— 现取一次 HEAD sha 再写一遍。
+   *
+   * 这不是静默覆盖：拿到的最新 sha 就是乐观锁，期间若又被改动，
+   * 这一次仍会失败并如实抛出，由上层决定重读重合并。
+   */
+  const attemptWith = (sha) =>
+    retrying(
+      async () => {
+        const res = await ghFetch(api, { token, method: 'PUT', body: makeBody(sha) });
+        const contentSha = (res.content && res.content.sha) || '';
+        return {
+          version: contentSha,
+          commit: (res.commit && res.commit.sha) || '',
+          changed: true
+        };
+      },
+      { retries: 2 }
+    );
+
+  try {
+    return await attemptWith(version);
+  } catch (err) {
+    if (err && err.code === 'SHA_MISSING') {
+      const head = await headFile(cfg, path, { token }).catch(() => null);
+      if (head && head.sha) {
+        return attemptWith(head.sha);
+      }
+    }
+    throw err;
+  }
 }
 
 export async function deleteFile(cfg, path, { token } = {}) {

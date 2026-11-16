@@ -246,3 +246,37 @@ test('readFile 遇到 content 为空壳时原样返回，不假装成功', async
   assert.equal(res.unwrapped, false);
   assert.equal(JSON.parse(res.text).content, '');
 });
+
+test('没带 sha 时自动取 HEAD sha 重试一次（而不是冒泡成并发冲突）', async () => {
+  let puts = 0;
+  installFetch({
+    'GET /repos/me/bookmarks/contents/bookmarks.json': () =>
+      jsonRes({ sha: 'head-latest', size: 10, encoding: 'base64', content: Buffer.from('{}', 'utf8').toString('base64') }),
+    'PUT /repos/me/bookmarks/contents/bookmarks.json': (init) => {
+      puts++;
+      const body = JSON.parse(init.body);
+      if (!body.sha) return jsonRes({ message: 'Invalid request. "sha" wasn\'t supplied.' }, { status: 422 });
+      return jsonRes({ content: { sha: 'newsha' }, commit: { sha: 'c1' } });
+    }
+  });
+  const res = await writeFile(CFG, 'bookmarks.json', '{"a":1}', { token: TOKEN });
+  assert.equal(puts, 2, '应写两次：第一次被 422 拒，第二次带上 HEAD sha');
+  assert.equal(res.version, 'newsha');
+});
+
+test('sha 不匹配（409）不会被自动重试掩盖', async () => {
+  let puts = 0;
+  installFetch({
+    'GET /repos/me/bookmarks/contents/bookmarks.json': () =>
+      jsonRes({ sha: 'head-latest', size: 10, encoding: 'base64', content: Buffer.from('{}', 'utf8').toString('base64') }),
+    'PUT /repos/me/bookmarks/contents/bookmarks.json': () => {
+      puts++;
+      return jsonRes({ message: 'bookmarks.json is at abc but expected def' }, { status: 409 });
+    }
+  });
+  await assert.rejects(
+    () => writeFile(CFG, 'bookmarks.json', '{"a":1}', { token: TOKEN, version: 'stale' }),
+    (err) => err.code === 'CONFLICT'
+  );
+  assert.equal(puts, 1, '409 不该重试');
+});
