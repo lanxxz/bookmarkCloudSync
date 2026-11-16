@@ -58,6 +58,23 @@ for (const [size, icon] of Object.entries(manifest.icons || {})) {
   }
 }
 
+/*
+ * package.json 必须能被真正解析。
+ * 手改 JSON 时漏一个逗号，npm 会直接罢工，但 node --test 之类仍然能跑，
+ * 很容易在本地"看起来没事"却被 CI 拦住。
+ */
+const pkgPath = join(root, 'package.json');
+if (existsSync(pkgPath)) {
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    must(pkg.scripts && pkg.scripts.test, 'package.json 缺少 scripts.test');
+    must(pkg.scripts && pkg.scripts.check, 'package.json 缺少 scripts.check');
+    must(String(pkg.version || '') === String(manifest.version), 'package.json 与 manifest.json 版本不一致');
+  } catch (err) {
+    errors.push('package.json 解析失败：' + err.message);
+  }
+}
+
 /* 模板文件：CI 工作流必须存在，且引用同目录的校验脚本 */
 must(existsSync(join(root, 'tools/verify-doc.mjs')), '缺少 tools/verify-doc.mjs');
 must(existsSync(join(root, 'templates/verify-bookmarks.yml')), '缺少 templates/verify-bookmarks.yml');
