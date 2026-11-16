@@ -201,8 +201,19 @@
     <span id="save-hint" class="hint"></span>
   </div>
 
+  <section class="card" id="card-health">
+    <h2>5. 云端文档健康</h2>
+    <p class="hint">同步失败时先看这里：会显示云端文件的实际结构、前 800 个字符，以及能不能自动修复。</p>
+    <div class="row gap">
+      <button id="btn-inspect" class="ghost">检查云端文档</button>
+      <button id="btn-repair" class="ghost">自动归一化</button>
+      <button id="btn-rebuild" class="danger">用本机重建</button>
+    </div>
+    <pre id="health-out" class="preview-pre hidden"></pre>
+  </section>
+
   <section class="card">
-    <h2>5. 历史快照与恢复</h2>
+    <h2>6. 历史快照与恢复</h2>
     <div class="row gap">
       <button id="btn-snapshot" class="ghost">立即创建快照</button>
       <button id="btn-refresh-snapshots" class="ghost small">刷新列表</button>
@@ -216,7 +227,7 @@
   </section>
 
   <section class="card">
-    <h2>6. 环境自检</h2>
+    <h2>7. 环境自检</h2>
     <p class="hint">在 ego(lite) 这类 Chromium 分支上，扩展 API 的支持程度可能不同。部署前跑一次，能立刻看出是哪一项不满足。</p>
     <div class="row gap">
       <button id="btn-selftest" class="ghost">运行自检</button>
@@ -226,7 +237,7 @@
   </section>
 
   <section class="card">
-    <h2>7. 运行日志</h2>
+    <h2>8. 运行日志</h2>
     <div class="row gap">
       <button id="btn-refresh-logs" class="ghost small">刷新</button>
       <button id="btn-clear-logs" class="ghost small">清空</button>

@@ -183,25 +183,134 @@ export function serializeDoc(doc) {
   return JSON.stringify(doc);
 }
 
-export function docFromJson(text) {
+/**
+ * 解析云端文档。
+ *
+ * 除了"能不能用"，还必须回答"坏在哪"：之前只抛 invalid-doc，
+ * 用户看到的是一句没有任何信息量的话，只能干瞪眼。
+ *
+ * repair 默认开启，只兜三种"容器错了但数据还在自身格式里"的历史产物：
+ *   1. 裸数组          [ {id,...}, ... ]        有人直接把 nodes 序列化了
+ *   2. 对象当 Map      { nodes: { id: node } }   Map 被 JSON.stringify 掉了
+ *   3. 多包一层        { ok:true, doc:{...} }    把 parse 结果整个存了下来
+ * 以及 nodes 为 null 的空文档。形状不像我们的节点就一律不修，绝不瞎猜。
+ */
+export function docFromJson(text, { repair = true } = {}) {
   let data;
   try {
-    data = typeof text === 'string' ? JSON.parse(text) : text;
+    data = typeof text === 'string' ? JSON.parse(stripBom(text)) : text;
   } catch (err) {
-    return { ok: false, error: 'invalid-json', detail: String(err && err.message) };
+    return {
+      ok: false,
+      error: 'invalid-json',
+      detail: String(err && err.message),
+      preview: previewOf(text),
+      shape: typeof text
+    };
   }
+
+  let repaired = null;
+  if (repair) {
+    const fixed = repairShape(data);
+    if (fixed) {
+      data = fixed.doc;
+      repaired = fixed.how;
+    }
+  }
+
   const errors = validateDoc(data);
-  if (errors.length) return { ok: false, error: 'invalid-doc', errors };
-  return { ok: true, doc: normalizeDoc(data) };
+  if (errors.length) {
+    return {
+      ok: false,
+      error: 'invalid-doc',
+      errors,
+      preview: previewOf(text),
+      shape: describeShape(data)
+    };
+  }
+
+  const out = { ok: true, doc: normalizeDoc(data) };
+  if (repaired) out.repaired = repaired;
+  return out;
+}
+
+/** 去掉 UTF-8 BOM：从某些编辑器/工具导出的文件会带，JSON.parse 直接失败 */
+function stripBom(text) {
+  if (typeof text !== 'string') return text;
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+export function previewOf(text) {
+  const s = typeof text === 'string' ? text : String(text);
+  return s.slice(0, 240);
+}
+
+/** 给人类看的结构摘要：object{nodes:array(12),schemaVersion:number} */
+export function describeShape(data) {
+  if (data === null) return 'null';
+  if (Array.isArray(data)) return 'array(' + data.length + ')';
+  if (typeof data !== 'object') return typeof data;
+  const parts = [];
+  for (const key of Object.keys(data).slice(0, 6)) {
+    const v = data[key];
+    const kind = Array.isArray(v) ? 'array(' + v.length + ')' : v === null ? 'null' : typeof v;
+    parts.push(key + ':' + kind);
+  }
+  return 'object{' + parts.join(',') + '}';
+}
+
+export function looksLikeNode(n) {
+  return !!n && typeof n === 'object' && typeof n.id === 'string' && n.id.length > 0 && typeof n.type === 'string';
+}
+
+function repairShape(data) {
+  // 1. 裸数组
+  if (Array.isArray(data)) {
+    if (!data.length || data.some(looksLikeNode)) {
+      return { doc: { schemaVersion: SCHEMA_VERSION, revision: 0, nodes: data }, how: 'bare-array' };
+    }
+    return null;
+  }
+  if (!data || typeof data !== 'object') return null;
+
+  // 2. 多包一层 { ok, doc } / { doc }
+  const inner = data.doc;
+  if (inner && typeof inner === 'object' && inner.nodes !== undefined) {
+    return { doc: inner, how: 'unwrapped-doc' };
+  }
+
+  // 3. Map 被序列化成普通对象
+  if (data.nodes && typeof data.nodes === 'object' && !Array.isArray(data.nodes)) {
+    const values = Object.values(data.nodes);
+    if (!values.length || values.some(looksLikeNode)) {
+      return { doc: { ...data, nodes: values }, how: 'map-object' };
+    }
+    return null;
+  }
+
+  // 4. nodes 显式为 null / undefined
+  if (data.nodes === null || data.nodes === undefined) {
+    const rest = Object.keys(data).filter((k) => k !== 'nodes');
+    if (rest.length) return { doc: { ...data, nodes: [] }, how: 'null-nodes' };
+  }
+
+  return null;
 }
 
 export function validateDoc(data) {
   const errors = [];
   if (!data || typeof data !== 'object') return ['doc 不是对象'];
+  if (Array.isArray(data)) return ['doc 是数组，不是对象'];
   if (!Number.isFinite(data.schemaVersion)) errors.push('缺少 schemaVersion');
-  if (data.schemaVersion > SCHEMA_VERSION) errors.push('云端 schemaVersion 更新（' + data.schemaVersion + '），请升级扩展');
-  if (!Array.isArray(data.nodes)) errors.push('nodes 不是数组');
-  if (Array.isArray(data.nodes) && data.nodes.length > 500000) errors.push('nodes 数量异常');
+  else if (data.schemaVersion > SCHEMA_VERSION) errors.push('云端 schemaVersion=' + data.schemaVersion + ' 高于本扩展支持的 ' + SCHEMA_VERSION + '，请升级扩展');
+  if (!Array.isArray(data.nodes)) {
+    errors.push('nodes 不是数组（实际是 ' + (data.nodes === null ? 'null' : typeof data.nodes) + '）');
+  } else {
+    if (data.nodes.length > 500000) errors.push('nodes 数量异常：' + data.nodes.length);
+    if (data.nodes.length && !data.nodes.some(looksLikeNode)) {
+      errors.push('nodes 里的元素不像书签节点（缺少 id / type）');
+    }
+  }
   return errors;
 }
 

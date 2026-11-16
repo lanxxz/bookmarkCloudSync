@@ -38,6 +38,7 @@ import {
 } from './protocol.js';
 import { scanLocal, applyLocalPlan, refreshMapping, resolveRootParent, clearRootParentCache, clearLocalBookmarks } from './local.js';
 import { backendFor, isConflict, resolveToken, backendStatus, peekTokenFor } from './storage/index.js';
+import { describeShape } from './protocol.js';
 import { getSettings } from './auth.js';
 import { getIdbState, setIdbState, pruneLocalSnapshots } from './idb.js';
 import { saveLocalSnapshot, saveRemoteSnapshot, loadSnapshotNodes, SNAPSHOT_KIND } from './history.js';
@@ -213,8 +214,25 @@ export async function readRemote({ token, settings } = {}) {
   }
   const parsed = docFromJson(res.text);
   if (!parsed.ok) {
-    logger.error('云端文档解析失败', parsed);
-    throw Object.assign(new Error('云端文档格式异常：' + (parsed.error || 'unknown')), { code: 'REMOTE_CORRUPT' });
+    /*
+     * 这里的报错必须能自解释。
+     * 之前只抛 "云端文档格式异常：invalid-doc"，用户拿到这句话什么也做不了：
+     * 不知道是空文件、被别的东西覆盖了、还是版本比扩展新。
+     * 现在把「哪一条不满足」「文档长什么形状」「开头长什么样」都带上，
+     * 并且用 RemoteCorruptError 单独标记，让上层能给出修复建议。
+     */
+    const detail = (parsed.errors || []).join('；') || parsed.detail || '';
+    const err = new Error(
+      '云端文档格式异常：' + (parsed.error || 'unknown') + (detail ? '（' + detail + '）' : '') +
+      (parsed.shape ? '\n实际结构：' + parsed.shape : '')
+    );
+    err.code = 'REMOTE_CORRUPT';
+    err.detail = { error: parsed.error, errors: parsed.errors, shape: parsed.shape, preview: parsed.preview, path: cfg.path };
+    logger.error('云端文档解析失败：' + err.message, err.detail);
+    throw err;
+  }
+  if (parsed.repaired) {
+    logger.warn('云端文档结构异常但已自动修复：' + parsed.repaired + '（下次同步会写回标准格式）');
   }
   return {
     exists: true,
@@ -223,8 +241,145 @@ export async function readRemote({ token, settings } = {}) {
     etag: res.version || '',
     name: cfg.path,
     backend: backendName,
-    raw: res.text
+    raw: res.text,
+    repaired: parsed.repaired || ''
   };
+}
+
+/**
+ * 只读诊断：把云端文件当前的样子拿出来看。
+ * 修不好的时候，用户至少能看到"云端到底存了什么"。
+ */
+export async function inspectRemote({ token, settings } = {}) {
+  const s = settings || (await getSettings());
+  const { name: backendName, backend } = backendFor(s);
+  const cfg = backend.cfgFromSettings(s);
+  const res = await backend.readDoc(cfg, { token });
+
+  if (!res.exists) {
+    return { exists: false, backend: backendName, path: cfg.path };
+  }
+  const text = res.text || '';
+  const parsed = docFromJson(text);
+  return {
+    exists: true,
+    backend: backendName,
+    path: cfg.path,
+    version: res.version || '',
+    size: text.length,
+    preview: text.slice(0, 800),
+    shape: (() => {
+      try {
+        return describeShape(JSON.parse(text));
+      } catch {
+        return '不是合法 JSON';
+      }
+    })(),
+    parsable: parsed.ok,
+    repaired: parsed.repaired || '',
+    errors: parsed.ok ? [] : parsed.errors || [parsed.error]
+  };
+}
+
+/**
+ * 修复云端文档（带备份）。
+ *
+ * 三种处置：
+ *  - repair  ：结构能认出但格式不规范 -> 归一化后写回
+ *  - rebuild ：彻底读不懂 -> 把坏内容备份到 bcs-backup/，再用本机书签重建
+ *  - 都不选  ：什么都不做，用户自己决定
+ *
+ * 无论哪种，都先确认云端内容已备份，再覆盖 —— 这份文件是他们唯一的数据。
+ */
+export async function repairRemote({ token, settings, mode = 'repair', confirmOverwrite = false } = {}) {
+  const s = settings || (await getSettings());
+  const { name: backendName, backend } = backendFor(s);
+  const cfg = backend.cfgFromSettings(s);
+  const token2 = token || (await resolveToken(s));
+  const state = (await loadState()) || (await ensureDeviceId(), await loadState());
+
+  const res = await backend.readDoc(cfg, { token: token2 });
+  if (!res.exists) return { ok: false, error: '云端没有文档，无需修复' };
+
+  /* 1. 备份原始内容（无论在哪种模式下都先做） */
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupName = 'bcs-backup/bad-' + stamp + '.json';
+  try {
+    await backend.writeDoc(
+      { ...cfg, path: backupName },
+      res.text,
+      { token: token2, message: 'chore(bcs): backup unparsable document ' + stamp }
+    );
+    logger.warn('已备份损坏文档到 ' + backupName);
+  } catch (err) {
+    logger.warn('备份损坏文档失败（继续尝试修复）', err);
+  }
+
+  const parsed = docFromJson(res.text);
+
+  /* 2. repair：能认出来就归一化写回 */
+  if (mode === 'repair') {
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        error: '无法自动修复：' + ((parsed.errors || []).join('；') || parsed.error),
+        backup: backupName,
+        needRebuild: true
+      };
+    }
+    const doc = createDoc({
+      nodes: parsed.doc.nodes,
+      revision: Math.max(1, (parsed.doc.revision || 0) + 1),
+      writer: state?.deviceId || '',
+      createdAt: parsed.doc.createdAt || Date.now()
+    });
+    await backend.writeDoc(cfg, serializeDoc(doc), {
+      token: token2,
+      version: res.version,
+      message: 'fix(bcs): normalize document structure r' + doc.revision
+    });
+    logger.success('云端文档已归一化写回（r' + doc.revision + '，' + doc.nodes.length + ' 个节点）');
+    return { ok: true, mode, backup: backupName, revision: doc.revision, nodes: doc.nodes.length, repaired: parsed.repaired || '' };
+  }
+
+  /* 3. rebuild：用本机书签重建 */
+  if (mode === 'rebuild') {
+    if (!confirmOverwrite) {
+      return { ok: false, error: 'rebuild 会覆盖云端内容，需要 confirmOverwrite=true', backup: backupName };
+    }
+    const deviceId = await ensureDeviceId();
+    const local = await scanLocal({ mapping: state?.mapping, deviceId });
+    const nodes = normalizeIndices(local.nodes);
+    const doc = createDoc({ nodes, revision: Math.max(1, (parsed.ok ? parsed.doc.revision : 0) + 1), writer: deviceId });
+    await backend.writeDoc(cfg, serializeDoc(doc), {
+      token: token2,
+      message: 'fix(bcs): rebuild document from local bookmarks r' + doc.revision
+    });
+    await saveState({
+      ...defaultState(deviceId),
+      baseIndex: nodes,
+      mapping: local.mapping,
+      seen: buildSeenSnapshot(nodes),
+      lastSyncAt: Date.now(),
+      lastError: ''
+    });
+    logger.success('已用本机书签重建云端文档（' + doc.nodes.length + ' 个节点）');
+    return { ok: true, mode, backup: backupName, revision: doc.revision, nodes: doc.nodes.length };
+  }
+
+  return { ok: false, error: '未知修复模式：' + mode, backup: backupName };
+}
+
+/** 重建后用来初始化 seen 台账（与 stampLocalChanges 的指纹一致，保证下一轮不抖动） */
+export function buildSeenSnapshot(index) {
+  const seen = {};
+  for (const [id, node] of index) {
+    seen[id] = {
+      fp: [node.parentId || '', node.type, node.title || '', node.url || '', node.index, node.deleted ? 1 : 0].join('\u0001'),
+      at: node.updatedAt || Date.now()
+    };
+  }
+  return seen;
 }
 
 /** 云端连接是否就绪（GitHub 需要 PAT + 仓库配置） */

@@ -447,6 +447,75 @@ $('btn-manual-token').addEventListener('click', async () => {
   await refreshAuth();
 });
 
+/* ---------------- 云端健康 ---------------- */
+
+function showHealth(lines) {
+  const box = $('health-out');
+  box.textContent = lines.join('\n');
+  box.classList.remove('hidden');
+}
+
+async function inspectRemoteDoc() {
+  showHealth(['检查中…']);
+  try {
+    const r = await send(MSG.REMOTE_INSPECT);
+    if (!r.exists) {
+      showHealth(['云端还没有同步文件（' + r.path + '）。点「立即同步」会创建。']);
+      return;
+    }
+    const lines = [
+      '后端：' + r.backend,
+      '路径：' + r.path,
+      '版本：' + (r.version ? r.version.slice(0, 24) : '—'),
+      '大小：' + r.size + ' 字节',
+      '结构：' + r.shape,
+      '可解析：' + (r.parsable ? '是' : '否'),
+      r.repaired ? '自动修复：' + r.repaired : '',
+      r.errors.length ? '问题：\n  · ' + r.errors.join('\n  · ') : '',
+      '',
+      '—— 前 800 字符 ——',
+      r.preview
+    ].filter((l) => l !== '');
+    showHealth(lines);
+  } catch (err) {
+    showHealth(['检查失败：' + err.message]);
+  }
+}
+
+async function repairRemoteDoc() {
+  if (!confirm('会先把当前的云端文件备份到 bcs-backup/，再归一化写回。\n如果结构无法识别，会提示你改用「用本机重建」。\n\n继续？')) return;
+  showHealth(['修复中…']);
+  try {
+    const r = await send(MSG.REPAIR_REMOTE, { mode: 'repair' });
+    if (r.ok) {
+      showHealth(['已修复：' + r.nodes + ' 个节点，云端版本 r' + r.revision, '备份：' + r.backup]);
+      toast('云端文档已归一化');
+    } else {
+      showHealth(['无法自动修复：' + r.error, r.backup ? '原始内容已备份到 ' + r.backup : '', '', '建议改用「用本机重建」。']);
+      toast('需要手动处理', 'warn');
+    }
+  } catch (err) {
+    showHealth(['修复失败：' + err.message]);
+  }
+}
+
+async function rebuildRemoteDoc() {
+  if (!confirm('这会把云端文档整份替换成"当前这台电脑的书签"。\n另一台设备上独有的书签不会保留。\n原始内容会先备份到 bcs-backup/。\n\n确定继续？')) return;
+  if (!confirm('再确认一次：云端将被本机书签覆盖。')) return;
+  showHealth(['重建中…']);
+  try {
+    const r = await send(MSG.REPAIR_REMOTE, { mode: 'rebuild', confirmOverwrite: true });
+    showHealth(['已重建：' + r.nodes + ' 个节点，云端版本 r' + r.revision, '备份：' + r.backup]);
+    toast('云端文档已用本机书签重建');
+  } catch (err) {
+    showHealth(['重建失败：' + err.message]);
+  }
+}
+
+$('btn-inspect').addEventListener('click', inspectRemoteDoc);
+$('btn-repair').addEventListener('click', repairRemoteDoc);
+$('btn-rebuild').addEventListener('click', rebuildRemoteDoc);
+
 $('btn-snapshot').addEventListener('click', async () => {
   try {
     const res = await send(MSG.CREATE_SNAPSHOT, { reason: '手动快照' });

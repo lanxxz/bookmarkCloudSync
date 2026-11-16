@@ -28,5 +28,7 @@ export const MSG = Object.freeze({
   GITHUB_STATUS: 'github-status',
   GITHUB_REPOS: 'github-repos',
   BACKEND_SET: 'backend-set',
-  BACKEND_STATUS: 'backend-status'
+  BACKEND_STATUS: 'backend-status',
+  REPAIR_REMOTE: 'repair-remote',
+  REMOTE_INSPECT: 'remote-inspect'
 });

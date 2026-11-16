@@ -26,7 +26,9 @@ import {
   restoreSnapshot,
   resetSyncState,
   isLocked,
-  loadState
+  loadState,
+  inspectRemote,
+  repairRemote
 } from '../lib/sync.js';
 import { getLocalSnapshots, listRemoteSnapshots, saveLocalSnapshot, SNAPSHOT_KIND } from '../lib/history.js';
 import { scanLocal } from '../lib/local.js';
@@ -253,6 +255,12 @@ async function handleMessage(msg) {
       });
       return restoreSnapshot({ source: 'local', id: record.id, mode: msg.mode || 'replace' });
     }
+
+    case MSG.REMOTE_INSPECT:
+      return inspectRemote();
+
+    case MSG.REPAIR_REMOTE:
+      return repairRemote({ mode: msg.mode || 'repair', confirmOverwrite: !!msg.confirmOverwrite });
 
     case MSG.RESET_SYNC:
       return resetSyncState();
