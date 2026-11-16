@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 2,
+  "revision": 3,
+  "writer": "dev-a1b2c3d4e5",
+  "createdAt": 1730000000000,
+  "updatedAt": 1730000600000,
+  "nodes": [
+    {
+      "id": "f_lq3k2j1h0",
+      "parentId": "root",
+      "type": "folder",
+      "title": "工作",
+      "url": "",
+      "index": 0,
+      "deleted": false,
+      "deletedAt": 0,
+      "updatedAt": 1730000000000,
+      "deviceId": "dev-a1b2c3d4e5"
+    },
+    {
+      "id": "b_lq3k2j1h1",
+      "parentId": "f_lq3k2j1h0",
+      "type": "bookmark",
+      "title": "GitHub",
+      "url": "https://github.com/",
+      "index": 0,
+      "deleted": false,
+      "deletedAt": 0,
+      "updatedAt": 1730000100000,
+      "deviceId": "dev-a1b2c3d4e5"
+    },
+    {
+      "id": "b_lq3k2j1h2",
+      "parentId": "root",
+      "type": "bookmark",
+      "title": "Hacker News",
+      "url": "https://news.ycombinator.com/",
+      "index": 1,
+      "deleted": false,
+      "deletedAt": 0,
+      "updatedAt": 1730000200000,
+      "deviceId": "dev-a1b2c3d4e5"
+    },
+    {
+      "id": "b_lq3k2j1h3",
+      "parentId": "root",
+      "type": "bookmark",
+      "title": "已删除的旧收藏",
+      "url": "https://example.com/old",
+      "index": 2,
+      "deleted": true,
+      "deletedAt": 1730000600000,
+      "updatedAt": 1730000600000,
+      "deviceId": "dev-a1b2c3d4e5"
+    }
+  ]
+}

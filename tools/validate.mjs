@@ -58,6 +58,10 @@ for (const [size, icon] of Object.entries(manifest.icons || {})) {
   }
 }
 
+/* 模板文件：CI 工作流必须存在，且引用同目录的校验脚本 */
+must(existsSync(join(root, 'tools/verify-doc.mjs')), '缺少 tools/verify-doc.mjs');
+must(existsSync(join(root, 'templates/verify-bookmarks.yml')), '缺少 templates/verify-bookmarks.yml');
+
 /* HTML 资源引用检查 */
 for (const html of ['src/ui/popup.html', 'src/ui/options.html']) {
   const full = join(root, html);

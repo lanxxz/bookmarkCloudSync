@@ -147,8 +147,12 @@ bookmarkCloudSync/
 │   └── ui/
 │       ├── popup.html/js/css  状态、立即同步、预览、待确认
 │       └── options.html/js/css 授权、参数、冲突策略、快照、自检、日志
-├── tests/                     70 个单元/仿真测试（node:test）
+├── tests/                     103 个单元/仿真测试（node:test）
 ├── tools/                     图标、扩展 key、校验、打包脚本
+│   └── verify-doc.mjs         独立文档校验器（可拷进书签仓库跑 CI）
+├── templates/
+│   ├── verify-bookmarks.yml   书签仓库用的 GitHub Actions 日检
+│   └── bookmarks.example.json 文档格式示例
 └── docs/                      协议说明、部署、排错
 ~~~
 
@@ -218,11 +222,12 @@ bookmarkCloudSync/
 ## 六、开发与验证
 
 ~~~bash
-npm run test     # 70 个测试：合并语义、树修复、墓碑、删除保护、双设备收敛仿真、GitHub 后端契约
+npm run test     # 103 个测试：合并语义、树修复、墓碑、删除保护、双设备收敛仿真、GitHub 后端契约、文档校验器与 CLI 退出码
 npm run check    # manifest 校验 + 全部模块装载 + 未使用导入
 npm run icons    # 重新生成图标
 npm run key      # 重新生成扩展公钥（会改变扩展 ID）
 npm run pack     # 打包 dist/bookmark-cloud-sync-vX.Y.Z.zip
+npm run verify   # 独立校验 bookmarks.json（结构 + 与上一版对比）
 ~~~
 
 测试里最重要的是 tests/two-devices.test.js：它用假云端跑两台设备的完整同步流程，验证

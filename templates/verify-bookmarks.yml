@@ -1,0 +1,102 @@
+# 书签文档日检
+#
+# 放在「书签仓库」里（不是扩展仓库）：.github/workflows/verify-bookmarks.yml
+# 作用：每天拉一次 bookmarks.json，做结构校验 + 与上一版对比，
+#       发现批量删除/结构损坏就在 Actions Summary 里报出来，必要时开 issue。
+#
+# 配套脚本：扩展仓库的 tools/verify-doc.mjs。把它一起拷进书签仓库就能完全自包含。
+
+name: Verify bookmarks
+
+on:
+  schedule:
+    # UTC 02:17 = 北京时间 10:17。避开整点，减少 GitHub 调度延迟。
+    - cron: '17 2 * * *'
+  push:
+    paths:
+      - 'bookmarks.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出完整历史（需要 HEAD~1 做对比）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 结构校验 + 版本对比
+        id: verify
+        run: |
+          node verify-doc.mjs bookmarks.json --github-summary --json > report.json
+          code=$?
+          node -e "
+            const fs = require('fs');
+            const r = JSON.parse(fs.readFileSync('report.json', 'utf8'));
+            const out = [];
+            out.push('verdict=' + r.verdict);
+            if (r.stats) out.push('total=' + r.stats.total);
+            if (r.diff) out.push('removed=' + r.diff.removed);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, out.join('\\n') + '\\n');
+          "
+          echo "exit=$code" >> $GITHUB_OUTPUT
+          exit 0
+
+      - name: 汇总到 Actions 页面
+        run: node verify-doc.mjs bookmarks.json --github-summary > /dev/null
+
+      - name: 结构损坏 -> 失败
+        if: steps.verify.outputs.verdict == 'invalid'
+        run: |
+          echo "::error::bookmarks.json 结构校验失败，请查看 Summary 里的错误列表"
+          exit 1
+
+      - name: 可疑变更 -> 开 issue（同样的只开一次）
+        if: steps.verify.outputs.verdict == 'suspicious'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('report.json', 'utf8'));
+            const removed = report.diff ? report.diff.removed : '?';
+            const title = '书签同步异常：本轮删除 ' + removed + ' 条';
+            const body = [
+              '自动检查发现可疑变更，请确认是否为自己操作。',
+              '',
+              '```',
+              ...(report.warnings || []).slice(0, 20),
+              '```',
+              '',
+              '如果确认无误，直接关闭本 issue；下次异常会再开一条（同名会自动跳过）。'
+            ].join('\\n');
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'bookmark-sync'
+            });
+            if (open.some((i) => i.title === title)) {
+              console.log('已有同类 issue，跳过');
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['bookmark-sync']
+            });
+
+      - name: 保留报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bookmark-report
+          path: report.json
+          retention-days: 30
